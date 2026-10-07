@@ -36,18 +36,24 @@ def prepare(args):
     providers = {p.GetCustomDataByKey('blender:id'): p for p in stage.Traverse()
                  if p.GetTypeName() in {'RigExecJoint', 'RigExecControl'}
                  and p.GetCustomDataByKey('blender:id')}
+    edit_providers = {}
+    for ident, provider in providers.items():
+        relation = provider.GetRelationship('blender:channelControl')
+        targets = relation.GetTargets() if relation else []
+        edit_providers[ident] = stage.GetPrimAtPath(targets[0]) if len(targets) == 1 else provider
     poses = []
     bones = set()
+    measured_drags = [row for row in desktop['drags'] if row.get('control')]
     if reference:
         for pose in reference['poses']:
-            edits = {str(providers[edit['id']].GetPath()) + '.avars:' + edit['channel']: edit['value']
+            edits = {str(edit_providers[edit['id']].GetPath()) + '.avars:' + edit['channel']: edit['value']
                      for edit in pose['edits']}
             poses.append({'name': pose['name'], 'edits': edits})
             bones.update(str(providers[ident].GetPath()) for ident in pose['bones'] if ident in providers)
     else:
-        bones.update(row['control'] for row in desktop['drags'])
+        bones.update(row['control'] for row in measured_drags)
     controls = []
-    for row in desktop['drags']:
+    for row in measured_drags:
         controls.append({'workload': row['workload'], 'path': row['control'],
                          'setup': row.get('workload_setup', {})})
     file_name = 'Biped.usdz' if name == 'Biped' else 'Blender-' + name + '.usdz'
@@ -76,9 +82,10 @@ def compare(args):
     report['source_sha256'] = metadata['source_sha256']
     report['desktop_report'] = metadata['desktop']
     speed = []
-    if len(report['drags']) != len(desktop['drags']):
+    measured_drags = [row for row in desktop['drags'] if row.get('control')]
+    if len(report['drags']) != len(measured_drags):
         raise ValueError('incomplete control workload capture')
-    for actual, prior in zip(report['drags'], desktop['drags']):
+    for actual, prior in zip(report['drags'], measured_drags):
         if actual['control'] != prior['control']:
             raise ValueError('control workload mismatch')
         row = {'workload': actual['workload'], 'samples': len(actual['samples'])}

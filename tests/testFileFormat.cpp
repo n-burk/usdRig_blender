@@ -35,6 +35,9 @@ int main(int argc,char **argv) {
         CHECK(layer->GetCustomLayerData()["blenderRig:complete"].Get<bool>());
         int joints=0,skins=0,constraints=0,meshes=0;
         for(const auto &prim:stage->Traverse()) {
+            CHECK(!prim.HasRelationship(TfToken("blender:editorFrame")));
+            CHECK(!prim.HasRelationship(TfToken("blender:control")));
+            CHECK(!prim.HasCustomDataKey(TfToken("blender:editableChannels")));
             joints+=prim.GetTypeName()==TfToken("RigExecJoint");
             skins+=prim.GetTypeName()==TfToken("RigExecSkinMover");
             constraints+=prim.GetTypeName()==TfToken("RigExecPositionConstraint");
@@ -64,23 +67,115 @@ int main(int argc,char **argv) {
         bad=json.GetJsObject(); auto meshesData=bad["meshes"].GetJsArray(); auto mesh=meshesData[0].GetJsObject(); mesh["indices"]=JsValue(JsArray{JsValue(999)}); meshesData[0]=JsValue(mesh); bad["meshes"]=JsValue(meshesData); fail(JsValue(bad));
         bad=json.GetJsObject(); auto cons=bad["constraints"].GetJsArray(); auto con=cons[0].GetJsObject(); con["source"]=con["owner"]; cons[0]=JsValue(con); bad["constraints"]=JsValue(cons); fail(JsValue(bad));
         // Picker links obey the same transactional import contract as graph data.
-        const auto controlId=json.GetJsObject().at("nodes").GetJsArray()[0].GetJsObject().at("id");
+        const auto controlId=json.GetJsObject().at("nodes").GetJsArray()[2].GetJsObject().at("id");
         JsObject button{{"label",JsValue("Root")},{"controls",JsValue(JsArray{controlId})}};
         JsObject page{{"name",JsValue("Main")},{"buttons",JsValue(JsArray{JsValue(button)})}};
         JsObject picker{{"owner",controlId},{"name",JsValue("Character")},
                         {"source_kind",JsValue("Rigify control collections")},
                         {"pages",JsValue(JsArray{JsValue(page)})}};
         auto withPicker=json.GetJsObject(); withPicker["pickers"]=JsValue(JsArray{JsValue(picker)});
+        auto pickerNodes=withPicker["nodes"].GetJsArray();
+        for(size_t i:{size_t(2),size_t(3)}) {
+            auto bone=pickerNodes[i].GetJsObject(); bone["armature"]=JsValue("Armature");
+            pickerNodes[i]=JsValue(bone);
+        }
+        withPicker["nodes"]=JsValue(pickerNodes);
         auto pickerLayer=SdfLayer::CreateAnonymous("picker.blendrig",{{"strict","1"}});
         CHECK(pickerLayer->ImportFromString(JsWriteToString(JsValue(withPicker))));
         auto pickerStage=UsdStage::Open(pickerLayer); int pickerButtons=0;
+        int editableBones=0;
+        for(const auto &prim:pickerStage->Traverse()) {
+            if(prim.GetTypeName()!=TfToken("RigExecJoint"))continue;
+            SdfPathVector targets;
+            CHECK(prim.GetRelationship(TfToken("blender:channelControl")).GetTargets(&targets));
+            CHECK(targets.size()==1);
+            auto control=pickerStage->GetPrimAtPath(targets.front()); CHECK(control);
+            CHECK(control.GetTypeName()==TfToken("RigExecControl"));
+            CHECK(control.GetCustomDataByKey(TfToken("blender:sourceId"))==prim.GetCustomDataByKey(TfToken("blender:id")));
+            CHECK(!control.GetAttribute(TfToken("posed:space")).HasAuthoredConnections());
+            TfToken order; CHECK(control.GetAttribute(TfToken("avars:rotationOrder")).Get(&order));
+            CHECK(order==TfToken("XYZ"));
+            for(const auto *name:{"default:space"}) {
+                SdfPathVector connections;
+                CHECK(control.GetAttribute(TfToken(name)).GetConnections(&connections));
+                CHECK(connections.size()==1);
+                CHECK(connections.front().GetPrimPath().HasPrefix(SdfPath("/Rig/ControlSpaces")));
+            }
+            for(const auto *channel:{"tx","ty","tz","rx","ry","rz","sx","sy","sz"}) {
+                SdfPathVector connections;
+                CHECK(prim.GetAttribute(TfToken(std::string("avars:")+channel)).GetConnections(&connections));
+                CHECK(connections.size()==1);
+                CHECK(connections.front()==targets.front().AppendProperty(TfToken(std::string("avars:")+channel)));
+            }
+            ++editableBones;
+        }
+        CHECK(editableBones==2);
         for(const auto &prim:pickerStage->Traverse()) {
             if(prim.GetTypeName()!=TfToken("RigExecPickerButton"))continue;
             ++pickerButtons; SdfPathVector targets;
             CHECK(prim.GetRelationship(TfToken("rigExec:picker:controls")).GetTargets(&targets));
             CHECK(targets.size()==1); CHECK(pickerStage->GetPrimAtPath(targets[0]));
+            CHECK(pickerStage->GetPrimAtPath(targets[0]).GetTypeName()==TfToken("RigExecControl"));
+            CHECK(pickerStage->GetPrimAtPath(targets[0]).GetCustomDataByKey(TfToken("blender:sourceId")).Get<std::string>()=="Root");
+            CHECK(!pickerStage->GetPrimAtPath(targets[0]).GetAttribute(TfToken("posed:space")).HasAuthoredConnections());
         }
         CHECK(pickerButtons==1);
+        auto genericPicker=json.GetJsObject(); genericPicker["pickers"]=JsValue(JsArray{JsValue(picker)});
+        auto genericLayer=SdfLayer::CreateAnonymous("generic-picker.blendrig",{{"strict","1"}});
+        CHECK(genericLayer->ImportFromString(JsWriteToString(JsValue(genericPicker))));
+        auto genericStage=UsdStage::Open(genericLayer);
+        auto genericButton=genericStage->GetPrimAtPath(SdfPath("/Rig/Pickers/Root/page_0/button_0"));
+        CHECK(genericButton);
+        SdfPathVector genericTargets;
+        CHECK(genericButton.GetRelationship(TfToken("rigExec:picker:controls")).GetTargets(&genericTargets));
+        CHECK(genericTargets.size()==1);
+        CHECK(genericStage->GetPrimAtPath(genericTargets.front()).GetTypeName()==TfToken("RigExecJoint"));
+        auto constrainedGeneric=genericPicker;
+        auto constrainedButton=button; constrainedButton["controls"]=JsValue(JsArray{JsValue("Tip")});
+        auto constrainedPage=page; constrainedPage["buttons"]=JsValue(JsArray{JsValue(constrainedButton)});
+        auto constrainedPicker=picker; constrainedPicker["pages"]=JsValue(JsArray{JsValue(constrainedPage)});
+        constrainedGeneric["pickers"]=JsValue(JsArray{JsValue(constrainedPicker)});
+        auto constrainedLayer=SdfLayer::CreateAnonymous("constrained-generic.blendrig");
+        CHECK(constrainedLayer->ImportFromString(JsWriteToString(JsValue(constrainedGeneric))));
+        auto constrainedStage=UsdStage::Open(constrainedLayer);
+        CHECK(constrainedStage->GetPrimAtPath(SdfPath("/Rig/Pickers/Root/page_0/button_0"))
+              .GetCustomDataByKey(TfToken("blender:unavailable")).Get<bool>());
+        auto unavailable=withPicker;
+        auto unavailableNodes=unavailable["nodes"].GetJsArray();
+        auto connected=unavailableNodes[2].GetJsObject(); connected["connected"]=JsValue(true);
+        unavailableNodes[2]=JsValue(connected); unavailable["nodes"]=JsValue(unavailableNodes);
+        auto unavailableButton=button; unavailableButton["controls"]=JsValue(JsArray{controlId,JsValue("Tip")});
+        auto unavailablePage=page; unavailablePage["buttons"]=JsValue(JsArray{JsValue(unavailableButton)});
+        auto unavailablePicker=picker; unavailablePicker["pages"]=JsValue(JsArray{JsValue(unavailablePage)});
+        unavailable["pickers"]=JsValue(JsArray{JsValue(unavailablePicker)});
+        auto unavailableLayer=SdfLayer::CreateAnonymous("unavailable.blendrig");
+        CHECK(unavailableLayer->ImportFromString(JsWriteToString(JsValue(unavailable))));
+        auto unavailableStage=UsdStage::Open(unavailableLayer);
+        auto inactive=unavailableStage->GetPrimAtPath(SdfPath("/Rig/Pickers/Root/page_0/button_0"));
+        CHECK(inactive);
+        SdfPathVector inactiveTargets;
+        auto inactiveRelation=inactive.GetRelationship(TfToken("rigExec:picker:controls"));
+        if(inactiveRelation) inactiveRelation.GetTargets(&inactiveTargets);
+        CHECK(inactiveTargets.empty());
+        std::string inactiveLabel; CHECK(inactive.GetAttribute(TfToken("ui:text")).Get(&inactiveLabel));
+        CHECK(inactiveLabel=="Root (unavailable)");
+        CHECK(inactive.GetCustomDataByKey(TfToken("blender:unavailable")).Get<bool>());
+        auto unavailableStrict=SdfLayer::CreateAnonymous("unavailable-strict.blendrig",{{"strict","1"}});
+        { TfErrorMark errors; CHECK(!unavailableStrict->ImportFromString(JsWriteToString(JsValue(unavailable))));
+          CHECK(!errors.IsClean()); errors.Clear(); }
+        auto inertBinding=withPicker;
+        auto bindingButton=button; bindingButton["controls"]=JsValue(JsArray{});
+        bindingButton["source"]=JsValue(JsObject{{"binding",JsValue(JsObject{{"operator",JsValue("toggle")}})}});
+        auto bindingPage=page; bindingPage["buttons"]=JsValue(JsArray{JsValue(bindingButton)});
+        auto bindingPicker=picker; bindingPicker["pages"]=JsValue(JsArray{JsValue(bindingPage)});
+        inertBinding["pickers"]=JsValue(JsArray{JsValue(bindingPicker)});
+        auto bindingLayer=SdfLayer::CreateAnonymous("binding.blendrig");
+        CHECK(bindingLayer->ImportFromString(JsWriteToString(JsValue(inertBinding))));
+        auto bindingStage=UsdStage::Open(bindingLayer);
+        auto bindingPrim=bindingStage->GetPrimAtPath(SdfPath("/Rig/Pickers/Root/page_0/button_0"));
+        CHECK(bindingPrim.GetCustomDataByKey(TfToken("blender:unavailable")).Get<bool>());
+        std::string bindingLabel; CHECK(bindingPrim.GetAttribute(TfToken("ui:text")).Get(&bindingLabel));
+        CHECK(bindingLabel=="Root (unavailable)");
         // Full source identities remain metadata, never inflated prim names.
         // Sanitization, truncation, reserved helper names and duplicate labels
         // must stay distinct and independent of source-array ordering.

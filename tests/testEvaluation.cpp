@@ -1,6 +1,7 @@
 #include "rigExec/rigEvaluator.h"
 #include "pxr/base/plug/registry.h"
 #include "pxr/base/js/json.h"
+#include "pxr/usd/sdf/layer.h"
 #include "pxr/usd/usd/primRange.h"
 #include <cmath>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <tuple>
 PXR_NAMESPACE_USING_DIRECTIVE
 #define CHECK(x) do { if(!(x)) throw std::runtime_error("check failed: " #x); } while(false)
 int main(int argc,char **argv) {
@@ -29,6 +31,12 @@ int main(int argc,char **argv) {
                 else nodes[id.Get<std::string>()]=prim.GetPath();
             }
         }
+        std::map<std::string,SdfPath> channels=nodes;
+        for(const auto &entry:nodes) {
+            SdfPathVector targets;
+            if(stage->GetPrimAtPath(entry.second).GetRelationship(TfToken("blender:channelControl")).GetTargets(&targets) && targets.size()==1)
+                channels[entry.first]=targets.front();
+        }
         auto points=[&](const std::string &id) {
             auto pose=evaluator.Evaluate(UsdTimeCode::Default());
             for(const auto &error:pose.diagnostics) std::cerr<<error<<'\n'; CHECK(pose.valid);
@@ -37,7 +45,7 @@ int main(int argc,char **argv) {
         };
         if(argc==4) {
             auto rest=points("Body"); CHECK(rest.size()==4); CHECK((rest[2]-GfVec3f(1,1,0)).GetLength()<1e-5);
-            auto control=stage->GetPrimAtPath(nodes.at("Driver"));
+            auto control=stage->GetPrimAtPath(channels.at("Driver"));
             CHECK(control.GetAttribute(TfToken("avars:tx")).Set(2.0));
             auto moved=points("Body");
             CHECK((moved[0]-GfVec3f(0,0,0)).GetLength()<1e-5);
@@ -45,6 +53,75 @@ int main(int argc,char **argv) {
             CHECK((moved[3]-GfVec3f(1,1,0)).GetLength()<1e-5);
             CHECK(control.GetAttribute(TfToken("avars:tx")).Set(0.0));
             CHECK((points("Body")[2]-rest[2]).GetLength()<1e-5);
+            // A synthetic Blender armature exercises the converter's native
+            // SpaceSwitch controls independently of the skin fixture's plain
+            // RigExec joints. Repeated edits keep one evaluator compiled.
+            std::ifstream input(argv[3]); CHECK(input);
+            auto synthetic=JsParseStream(input).GetJsObject();
+            auto sourceNodes=synthetic.at("nodes").GetJsArray();
+            for(auto &item:sourceNodes) {
+                auto node=item.GetJsObject();
+                if(node.at("kind").GetString()=="joint") node["armature"]=JsValue("Armature");
+                item=JsValue(node);
+            }
+            synthetic["nodes"]=JsValue(sourceNodes);
+            const auto originalConstraints=synthetic.at("constraints").GetJsArray();
+            synthetic["constraints"]=JsValue(JsArray{});
+            auto nativeLayer=SdfLayer::CreateAnonymous("native-controls.blendrig");
+            CHECK(nativeLayer->ImportFromString(JsWriteToString(JsValue(synthetic))));
+            auto nativeStage=UsdStage::Open(nativeLayer); CHECK(nativeStage);
+            nativeStage->SetEditTarget(nativeStage->GetSessionLayer());
+            std::map<std::string,SdfPath> bonePaths,controlPaths;
+            for(const auto &prim:nativeStage->Traverse()) {
+                if(prim.GetTypeName()!=TfToken("RigExecJoint"))continue;
+                auto id=prim.GetCustomDataByKey(TfToken("blender:id"));
+                if(!id.IsHolding<std::string>())continue;
+                SdfPathVector targets;
+                CHECK(prim.GetRelationship(TfToken("blender:channelControl")).GetTargets(&targets));
+                CHECK(targets.size()==1);
+                bonePaths[id.Get<std::string>()]=prim.GetPath();
+                controlPaths[id.Get<std::string>()]=targets.front();
+            }
+            CHECK(bonePaths.size()==2);
+            rigExec::RigExecRigEvaluator nativeRig(nativeStage,SdfPath("/Rig"));
+            errors.clear(); CHECK(nativeRig.Compile(&errors)); CHECK(errors.empty());
+            const auto sameFrame=[&](const rigExec::RigExecPointFrame &a,const rigExec::RigExecPointFrame &b) {
+                for(int i=0;i<4;++i)CHECK((a.points[i]-b.points[i]).GetLength()<1e-6);
+            };
+            for(const auto &edit:std::vector<std::tuple<std::string,std::string,double>>{
+                {"Armature","tx",1.25},{"Armature","rz",25.0},{"Root","tx",2.0},
+                {"Root","ry",-20.0},{"Root","sx",1.3},{"Tip","tz",0.4},
+                {"Tip","rx",35.0},{"Tip","sy",0.8}}) {
+                SdfPath path;
+                if(std::get<0>(edit)=="Armature") {
+                    for(const auto &prim:nativeStage->Traverse())
+                        if(prim.GetCustomDataByKey(TfToken("blender:id"))==VtValue(std::string("Armature"))) path=prim.GetPath();
+                } else path=controlPaths.at(std::get<0>(edit));
+                CHECK(nativeStage->GetPrimAtPath(path).GetAttribute(TfToken("avars:"+std::get<1>(edit))).Set(std::get<2>(edit)));
+                auto pose=nativeRig.Evaluate(UsdTimeCode::Default()); CHECK(pose.valid);
+                for(const auto &name:{"Root","Tip"})
+                    sameFrame(pose.controlFrames.at(controlPaths.at(name)),pose.jointFramesBase.at(bonePaths.at(name)));
+            }
+            auto constrained=synthetic;
+            auto follow=originalConstraints.front().GetJsObject();
+            follow["owner"]=JsValue("Root");
+            constrained["constraints"]=JsValue(JsArray{JsValue(follow)});
+            auto constrainedLayer=SdfLayer::CreateAnonymous("constrained-parent.blendrig");
+            CHECK(constrainedLayer->ImportFromString(JsWriteToString(JsValue(constrained))));
+            auto constrainedStage=UsdStage::Open(constrainedLayer); CHECK(constrainedStage);
+            constrainedStage->SetEditTarget(constrainedStage->GetSessionLayer());
+            rigExec::RigExecRigEvaluator constrainedRig(constrainedStage,SdfPath("/Rig"));
+            errors.clear(); CHECK(constrainedRig.Compile(&errors)); CHECK(errors.empty());
+            SdfPath driverPath;
+            for(const auto &prim:constrainedStage->Traverse())
+                if(prim.GetCustomDataByKey(TfToken("blender:id"))==VtValue(std::string("Driver")))driverPath=prim.GetPath();
+            CHECK(!driverPath.IsEmpty());
+            CHECK(constrainedStage->GetPrimAtPath(driverPath).GetAttribute(TfToken("avars:tx")).Set(5.0));
+            CHECK(constrainedStage->GetPrimAtPath(controlPaths.at("Tip")).GetAttribute(TfToken("avars:ry")).Set(20.0));
+            auto constrainedPose=constrainedRig.Evaluate(UsdTimeCode::Default()); CHECK(constrainedPose.valid);
+            sameFrame(constrainedPose.controlFrames.at(controlPaths.at("Tip")),constrainedPose.jointFramesBase.at(bonePaths.at("Tip")));
+            CHECK((constrainedPose.controlFrames.at(controlPaths.at("Root")).Origin()-
+                   constrainedPose.jointFramesBase.at(bonePaths.at("Root")).Origin()).GetLength()>1.0);
             std::cout<<"Native control -> constraint -> linear skin -> reset passed\n";
         } else {
             std::ifstream input(argv[4]); auto reference=JsParseStream(input).GetJsObject();
@@ -55,7 +132,7 @@ int main(int argc,char **argv) {
             if(incremental)for(const auto &data:reference.at("poses").GetJsArray())
                 for(const auto &edit:data.GetJsObject().at("edits").GetJsArray()) {
                     const auto &e=edit.GetJsObject();
-                    auto attr=stage->GetPrimAtPath(nodes.at(e.at("id").GetString())).GetAttribute(TfToken("avars:"+e.at("channel").GetString()));
+                    auto attr=stage->GetPrimAtPath(channels.at(e.at("id").GetString())).GetAttribute(TfToken("avars:"+e.at("channel").GetString()));
                     double value;CHECK(attr.Get(&value));initialChannels.emplace(attr.GetPath(),value);
                 }
             for(const auto &data:reference.at("poses").GetJsArray()) {
@@ -64,7 +141,7 @@ int main(int argc,char **argv) {
                 else stage->GetSessionLayer()->Clear();
                 for(const auto &edit:pose.at("edits").GetJsArray()) {
                     const auto &e=edit.GetJsObject();
-                    auto prim=stage->GetPrimAtPath(nodes.at(e.at("id").GetString()));
+                    auto prim=stage->GetPrimAtPath(channels.at(e.at("id").GetString()));
                     CHECK(prim.GetAttribute(TfToken("avars:"+e.at("channel").GetString())).Set(e.at("value").GetReal()));
                 }
                 JsArray samples;
@@ -87,7 +164,7 @@ int main(int argc,char **argv) {
                 stage->GetSessionLayer()->Clear();
                 for(const auto &edit:reference.at("native_guard_edits").GetJsArray()) {
                     const auto &e=edit.GetJsObject();
-                    auto prim=stage->GetPrimAtPath(nodes.at(e.at("id").GetString()));
+                    auto prim=stage->GetPrimAtPath(channels.at(e.at("id").GetString()));
                     CHECK(prim.GetAttribute(TfToken("avars:"+e.at("channel").GetString())).Set(e.at("value").GetReal()));
                 }
                 auto guarded=evaluator.Evaluate(UsdTimeCode::Default());CHECK(guarded.valid);

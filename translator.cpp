@@ -150,7 +150,7 @@ GfMatrix4d PoseMatrix(const JsArray &pose) {
 struct Node {
     JsValue data;
     std::string id,parent,kind,name;
-    SdfPath path;
+    SdfPath path,controlPath;
     GfMatrix4d rest{1},world{1};
     int state=0;
 };
@@ -177,6 +177,23 @@ public:
         operationOrder.insert(operationOrder.begin(),TfToken(name));
         return rig.NewMoverChain(name,target);
     }
+    bool HasActiveConstraint(const Node &node) const {
+        for(const auto &constraint:Array(Field(scene,"constraints")))
+            if(Str(constraint,"owner")==node.id && Flag(constraint,"enabled",true) &&
+               Number(Field(constraint,"influence"))>0) return true;
+        return false;
+    }
+    bool EditableBoneControl(const Node &bone) const {
+        if(bone.kind!="joint" || !Has(bone.data,"armature") ||
+           Flag(bone.data,"connected",false) || !Flag(bone.data,"local_location",true)) return false;
+        if(!bone.parent.empty()) {
+            const auto &parent=nodes.at(bone.parent);
+            if(parent.kind=="joint" &&
+               (!Flag(bone.data,"inherit_rotation",true) ||
+                (Has(bone.data,"inherit_scale") && Str(bone.data,"inherit_scale")!="FULL"))) return false;
+        }
+        return true;
+    }
     void Build(Node &n,size_t depth=0) {
         if(depth>512) throw std::runtime_error("rig hierarchy exceeds 512 levels");
         if(n.state==2) return;
@@ -189,6 +206,7 @@ public:
         if(!n.parent.empty()) { auto &p=Find(n.parent); Build(p,depth+1); parent=p.path; n.world=bindLocal*p.world; }
         else n.world=bindLocal;
         n.path=parent.AppendChild(TfToken(n.name));
+        n.controlPath=n.path;
         auto schema=rigExec::RigExecSchemaPrim::Define(stage,n.path,TfToken(n.kind=="joint" ? "RigExecJoint" : "RigExecControl"));
         schema.ApplyAPI(TfToken("NodeGraphNodeAPI"));
         schema.ApplyAPI(TfToken("RigExecControlAPI"));
@@ -217,6 +235,8 @@ public:
     }
     void Graph() {
         stage->DefinePrim(SdfPath("/Rig/Dag"),TfToken("Scope"));
+        stage->DefinePrim(SdfPath("/Rig/Controls"),TfToken("Scope"));
+        stage->DefinePrim(SdfPath("/Rig/ControlSpaces"),TfToken("Scope"));
         for(const auto &data:Array(Field(scene,"nodes"))) {
             Node n; n.data=data; n.id=Str(data,"id"); n.parent=Str(data,"parent");
             n.kind=Str(data,"kind"); n.rest=Matrix(Field(data,"rest"));
@@ -258,15 +278,93 @@ public:
             // must stop here; dependency refresh computes inheritance once.
             stage->GetPrimAtPath(bone.path).GetAttribute(TfToken("parent:space")).Set(GfMatrix4d(1));
             stage->GetPrimAtPath(bone.path).GetAttribute(TfToken("posed:space")).SetConnections({mechanism.GetPath().AppendProperty(TfToken("outputs:matrix"))});
+            if(!EditableBoneControl(bone)) {
+                if(Flag(bone.data,"visible",true) || Has(bone.data,"guide_points"))
+                    Warn("bone control is read-only in standard usdRig interaction: "+bone.id);
+                continue;
+            }
+            const SdfPath framePath=SdfPath("/Rig/ControlSpaces").AppendChild(TfToken(bone.name));
+            auto frame=rigExec::RigExecSchemaPrim::Define(stage,framePath,TfToken("RigExecControl"));
+            frame.SetAttribute(TfToken("rest:space"),VtValue(GfMatrix4d(1)));
+            frame.SetAttribute(TfToken("default:space"),VtValue(GfMatrix4d(1)));
+            frame.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
+            auto neutral=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("controlFrame_"+bone.name)),TfToken("RigExecBlenderBoneFrame"));
+            neutral.SetAttribute(TfToken("inputs:local"),VtValue(bone.rest));
+            neutral.SetAttribute(TfToken("inputs:inheritScale"),VtValue(TfToken(mode)));
+            neutral.SetAttribute(TfToken("inputs:inheritRotation"),VtValue(Flag(bone.data,"inherit_rotation",true)));
+            neutral.SetAttribute(TfToken("inputs:localLocation"),VtValue(true));
+            neutral.SetAttribute(TfToken("inputs:connected"),VtValue(false));
+            neutral.SetRelationship(TfToken("rigExec:sourceObject"),{object.path});
+            neutral.SetRelationship(TfToken("rigExec:poseInputs"),dependencies);
+            if(parent.kind=="joint") {
+                neutral.SetAttribute(TfToken("inputs:hasParent"),VtValue(true));
+                neutral.SetAttribute(TfToken("inputs:parentRest"),VtValue(parent.world*object.world.GetInverse()));
+                neutral.SetRelationship(TfToken("rigExec:parent"),{parent.path});
+            }
+            frame.GetPrim().GetAttribute(TfToken("posed:space")).SetConnections({neutral.GetPath().AppendProperty(TfToken("outputs:matrix"))});
+            const SdfPath controlParent=SdfPath("/Rig/Controls").AppendChild(TfToken(bone.name));
+            stage->DefinePrim(controlParent,TfToken("Scope"));
+            const SdfPath controlPath=controlParent.AppendChild(TfToken("Control"));
+            auto control=rigExec::RigExecSchemaPrim::Define(stage,controlPath,TfToken("RigExecControl"));
+            control.ApplyAPI(TfToken("RigExecControlAPI"));
+            control.ApplyAPI(TfToken("NodeGraphNodeAPI"));
+            control.SetAttribute(TfToken("rest:space"),VtValue(GfMatrix4d(1)));
+            control.SetAttribute(TfToken("avars:rotationOrder"),VtValue(TfToken("XYZ")));
+            auto prim=control.GetPrim();
+            prim.GetAttribute(TfToken("default:space")).SetConnections({framePath.AppendProperty(TfToken("default:space"))});
+            prim.SetDisplayName(Str(bone.data,"name"));
+            prim.SetCustomDataByKey(TfToken("blender:sourceId"),VtValue(bone.id));
+            UsdGeomImageable(prim).CreatePurposeAttr().Set(UsdGeomTokens->guide);
+            auto spaceSwitch=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("controlSpace_"+bone.name)),TfToken("RigExecSpaceSwitch"));
+            spaceSwitch.SetRelationship(TfToken("rigExec:target"),{controlPath});
+            spaceSwitch.SetRelationship(TfToken("rigExec:sources"),{framePath});
+            spaceSwitch.SetAttribute(TfToken("inputs:activeSpace"),VtValue(0.0));
+            const bool customShape=Has(bone.data,"guide_points") && !Array(Field(bone.data,"guide_points")).empty();
+            const bool ownShape=!Has(bone.data,"guide_source") || Str(bone.data,"guide_source").empty() || Str(bone.data,"guide_source")==bone.id;
+            control.SetAttribute(TfToken("guide:displayOpacity"),VtValue(Flag(bone.data,"visible",true) && (!customShape || !ownShape) ? 0.8f : 0.0f));
+            control.SetAttribute(TfToken("guide:scaleX"),VtValue(Num(bone.data,"length",1)*0.04));
+            control.SetAttribute(TfToken("guide:scaleY"),VtValue(Num(bone.data,"length",1)*0.04));
+            control.SetAttribute(TfToken("guide:scaleZ"),VtValue(Num(bone.data,"length",1)*0.04));
+            const auto &pose=Array(Field(bone.data,"pose"));
+            const char *channels[]={"tx","ty","tz","rx","ry","rz","sx","sy","sz"};
+            for(int i=0;i<9;++i) {
+                const TfToken channel(std::string("avars:")+channels[i]);
+                control.SetAttribute(channel,VtValue(Number(pose[i])));
+                stage->GetPrimAtPath(bone.path).GetAttribute(channel).SetConnections({controlPath.AppendProperty(channel)});
+            }
+            stage->GetPrimAtPath(bone.path).CreateRelationship(TfToken("blender:channelControl"),true).SetTargets({controlPath});
+            bone.controlPath=controlPath;
+            stage->GetPrimAtPath(bone.path).GetAttribute(TfToken("guide:radius")).Set(0.0);
+            if(HasActiveConstraint(bone) && customShape && ownShape)
+                Warn("native control guide displays pre-constraint edit frame: "+bone.id);
         }
     }
     void Guides() {
         for(auto &entry:nodes) {
             auto &n=entry.second;
             if(!Has(n.data,"guide_points") || Array(Field(n.data,"guide_points")).empty())continue;
-            auto owner=stage->GetPrimAtPath(n.path);
-            auto editor=rigExec::RigExecSchemaPrim::Define(stage,n.path.AppendChild(TfToken("EditorFrame")),TfToken("RigExecControl"));
-            editor.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
+            const bool ownShape=!Has(n.data,"guide_source") || Str(n.data,"guide_source").empty() || Str(n.data,"guide_source")==n.id;
+            if((n.controlPath!=n.path || (n.kind=="control" && !HasActiveConstraint(n))) && ownShape) {
+                auto control=rigExec::RigExecSchemaPrim::Define(stage,n.controlPath,TfToken("RigExecControl"));
+                VtVec3fArray points;VtIntArray counts;size_t total=0;
+                for(const auto &p:Array(Field(n.data,"guide_points")))points.push_back(Point(p));
+                for(const auto &v:Array(Field(n.data,"guide_counts"))) {
+                    int count=Integer(v);if(count<2)throw std::runtime_error("invalid guide polyline count");
+                    counts.push_back(count);total+=count;
+                }
+                if(total!=points.size())throw std::runtime_error("guide topology mismatch");
+                control.SetAttribute(TfToken("guide:shape"),VtValue(TfToken("custom")));
+                control.SetAttribute(TfToken("guide:points"),VtValue(points));
+                control.SetAttribute(TfToken("guide:curveVertexCounts"),VtValue(counts));
+                control.SetAttribute(TfToken("guide:wireWidth"),VtValue(Num(n.data,"guide_wire_width",0)));
+                control.SetAttribute(TfToken("guide:displayOpacity"),VtValue(Flag(n.data,"visible",true)?1.0f:0.0f));
+                control.SetAttribute(TfToken("guide:scaleX"),VtValue(1.0));
+                control.SetAttribute(TfToken("guide:scaleY"),VtValue(1.0));
+                control.SetAttribute(TfToken("guide:scaleZ"),VtValue(1.0));
+                if(Has(n.data,"guide_color"))control.SetAttribute(TfToken("guide:displayColor"),VtValue(Point(Field(n.data,"guide_color"))));
+                continue;
+            }
+            if(!ownShape) Warn("guide follows a different source and is not the native editable control: "+n.id);
             auto frame=[&](rigExec::RigExecSchemaPrim &target,Node &sourceNode,const std::string &suffix) {
                 auto expression=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("guide_"+n.name+suffix)),TfToken("RigExecBlenderCopyTransforms"));
                 expression.SetRelationship(TfToken("rigExec:source"),{sourceNode.path});
@@ -274,12 +372,6 @@ public:
                 target.SetAttribute(TfToken("parent:space"),VtValue(GfMatrix4d(1)));
                 target.GetPrim().GetAttribute(TfToken("posed:space")).SetConnections({expression.GetPath().AppendProperty(TfToken("outputs:matrix"))});
             };
-            frame(editor,n,"_editor");
-            owner.CreateRelationship(TfToken("blender:editorFrame"),true).SetTargets({editor.GetPath()});
-            bool editable=true;
-            for(const auto &c:Array(Field(scene,"constraints")))if(Str(c,"owner")==n.id && Flag(c,"enabled",true) && Number(Field(c,"influence"))>0)editable=false;
-            owner.SetCustomDataByKey(TfToken("blender:editableChannels"),VtValue(editable));
-            editor.GetPrim().CreateRelationship(TfToken("blender:control"),true).SetTargets({n.path});
             auto guide=rigExec::RigExecSchemaPrim::Define(stage,n.path.AppendChild(TfToken("Display")),TfToken("RigExecControl"));
             Node &shapeSource=Has(n.data,"guide_source") && !Str(n.data,"guide_source").empty() ? Find(Str(n.data,"guide_source")) : n;
             frame(guide,shapeSource,"_display");
@@ -297,8 +389,6 @@ public:
             guide.SetAttribute(TfToken("guide:wireWidth"),VtValue(Num(n.data,"guide_wire_width",0)));
             guide.SetAttribute(TfToken("guide:displayOpacity"),VtValue(Flag(n.data,"visible",true)?1.0f:0.0f));
             if(Has(n.data,"guide_color"))guide.SetAttribute(TfToken("guide:displayColor"),VtValue(Point(Field(n.data,"guide_color"))));
-            guide.GetPrim().CreateRelationship(TfToken("blender:control"),true).SetTargets({n.path});
-            guide.GetPrim().SetCustomDataByKey(TfToken("blender:owner"),VtValue(n.path.GetString()));
         }
     }
     void Constraints() {
@@ -908,6 +998,8 @@ public:
             picker.SetRelationship(TfToken("rigExec:picker:rig"),{SdfPath("/Rig")});
             picker.GetPrim().SetCustomDataByKey(TfToken("blender:sourceKind"),VtValue(Str(data,"source_kind")));
             picker.GetPrim().SetCustomDataByKey(TfToken("blender:source"),VtValue(JsWriteToString(data)));
+            if(Has(data,"source_ui") && !Str(data,"source_ui").empty())
+                Warn("picker source UI script is retained as metadata and not executed: "+owner.id);
             int pageOrder=0;
             for(const auto &pageData:Array(Field(data,"pages"))) {
                 auto panel=rigExec::RigExecSchemaPrim::Define(stage,picker.GetPath().AppendChild(TfToken("page_"+std::to_string(pageOrder))),TfToken("RigExecPickerPanel"));
@@ -927,13 +1019,35 @@ public:
                     button.SetAttribute(TfToken("ui:textColor"),VtValue(GfVec4f(1)));
                     button.SetAttribute(TfToken("ui:text"),VtValue(Str(buttonData,"label")));
                     button.SetAttribute(TfToken("ui:fontSize"),VtValue(10.0f));
+                    const bool sourceBinding=Has(buttonData,"source") && Has(Field(buttonData,"source"),"binding");
+                    if(sourceBinding)
+                        Warn("picker binding is selection-only; settings and operators are not translated: "+Str(buttonData,"label"));
                     SdfPathVector targets;
                     std::set<std::string> unique;
+                    bool unavailable=false;
                     for(const auto &id:Array(Field(buttonData,"controls"))) {
                         auto &control=Find(String(id));
                         if(!unique.insert(control.id).second)throw std::runtime_error("duplicate picker control target");
-                        targets.push_back(control.path);
+                        if((control.kind=="joint" && control.controlPath==control.path &&
+                            (Has(control.data,"armature") || HasActiveConstraint(control) ||
+                             stage->GetPrimAtPath(control.path).GetAttribute(TfToken("posed:space")).HasAuthoredConnections())) ||
+                           (control.kind=="control" && HasActiveConstraint(control))) {
+                            Warn("picker target is read-only in standard usdRig interaction: "+control.id);
+                            unavailable=true;
+                            continue;
+                        }
+                        targets.push_back(control.controlPath);
                     }
+                    unavailable=unavailable || (sourceBinding && targets.empty());
+                    if(unavailable) {
+                        targets.clear();
+                        button.SetAttribute(TfToken("ui:text"),VtValue(Str(buttonData,"label")+" (unavailable)"));
+                        button.SetAttribute(TfToken("ui:fill"),VtValue(GfVec4f(0.15f,0.15f,0.15f,1)));
+                        button.SetAttribute(TfToken("ui:textColor"),VtValue(GfVec4f(0.5f,0.5f,0.5f,1)));
+                        button.GetPrim().SetCustomDataByKey(TfToken("blender:unavailable"),VtValue(true));
+                    }
+                    else if(sourceBinding && !targets.empty())
+                        button.SetAttribute(TfToken("ui:text"),VtValue("Select "+Str(buttonData,"label")));
                     if(!targets.empty())button.SetRelationship(TfToken("rigExec:picker:controls"),targets);
                     button.GetPrim().SetCustomDataByKey(TfToken("blender:source"),VtValue(JsWriteToString(buttonData)));
                     ++index;

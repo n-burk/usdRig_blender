@@ -41,13 +41,6 @@ file(GENERATE OUTPUT "${_resources}/plugInfo.json" CONTENT
     "{\"Plugins\":[{\"Type\":\"library\",\"Name\":\"usdBlenderRig\",\"Root\":\"..\",\"LibraryPath\":\"$<TARGET_FILE:usdBlenderRig>\",\"ResourcePath\":\"resources\",\"Info\":{${_info}}}]}")
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/install/plugInfo.json" CONTENT
     "{\"Plugins\":[{\"Type\":\"library\",\"Name\":\"usdBlenderRig\",\"Root\":\"..\",\"LibraryPath\":\"../../$<TARGET_FILE_NAME:usdBlenderRig>\",\"ResourcePath\":\"resources\",\"Info\":{${_info}}}]}")
-set(_usdview "${CMAKE_CURRENT_BINARY_DIR}/usdview/usdBlenderRigUsdview")
-file(MAKE_DIRECTORY "${_usdview}")
-foreach(_file __init__.py blenderControlModel.py plugInfo.json)
-    configure_file("usdview/usdBlenderRigUsdview/${_file}" "${_usdview}/${_file}" COPYONLY)
-endforeach()
-install(FILES usdview/usdBlenderRigUsdview/__init__.py usdview/usdBlenderRigUsdview/blenderControlModel.py usdview/usdBlenderRigUsdview/plugInfo.json
-    DESTINATION lib/python/usdBlenderRigUsdview)
 install(TARGETS usdBlenderRig LIBRARY DESTINATION lib RUNTIME DESTINATION lib ARCHIVE DESTINATION lib)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/install/plugInfo.json" blender/extract.py blender/materials.py generatedSchema.usda
     DESTINATION lib/usd/usdBlenderRig/resources)

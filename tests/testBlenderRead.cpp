@@ -4,6 +4,8 @@
 #include "pxr/usd/sdf/layer.h"
 #include "pxr/usd/usd/stage.h"
 #include "pxr/usd/usd/prim.h"
+#include "pxr/usd/usd/attribute.h"
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -24,7 +26,14 @@ int main(int argc,char **argv) {
         auto format=SdfFileFormat::FindByExtension("blend"); CHECK(format);
         const std::string base=argv[3],source=base+"/rig.blend",unsupported=base+"/unsupported.blend";
         const auto bytes=Read(source); CHECK(format->CanRead(source));
-        CHECK(SdfLayer::FindOrOpen(base+"/strict.blend",{{"strict","1"}}));
+        { TfErrorMark errors; CHECK(!SdfLayer::FindOrOpen(base+"/strict.blend",{{"strict","1"}}));
+          CHECK(!errors.IsClean()); errors.Clear(); }
+        auto strictSnapshot=SdfLayer::FindOrOpen(base+"/strict.blend"); CHECK(strictSnapshot);
+        VtStringArray strictDiagnostics;
+        CHECK(UsdStage::Open(strictSnapshot)->GetDefaultPrim().GetAttribute(TfToken("blender:diagnostics")).Get(&strictDiagnostics));
+        CHECK(std::any_of(strictDiagnostics.begin(),strictDiagnostics.end(),[](const std::string &message) {
+            return message.find("picker binding is selection-only")!=std::string::npos;
+        }));
         { TfErrorMark errors; CHECK(!SdfLayer::FindOrOpen(source,{{"strict","1"}})); CHECK(!errors.IsClean()); errors.Clear(); }
         auto layer=SdfLayer::CreateAnonymous("atomic.usda");
         CHECK(format->Read(get_pointer(layer),source,false));

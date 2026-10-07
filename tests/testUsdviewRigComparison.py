@@ -28,6 +28,10 @@ def testUsdviewInputFunction(app):
     import gizmoUI
     import rigExecUsdview
 
+    assert gizmoMath.ComputeRigFrames.__module__ == 'gizmoMath'
+    assert not getattr(gizmoMath.ComputeRigFrames, '_blender_adapter', False)
+    assert 'usdBlenderRigUsdview' not in sys.modules
+
     sys.path.insert(0, str(Path.cwd() / 'tests'))
     from compareRigReference import compare_pose
 
@@ -123,8 +127,14 @@ def testUsdviewInputFunction(app):
     if blender:
         names = [('global root', 'root'), ('left hand IK', 'IK-Wrist.L' if label == 'Snow' else 'hand_ik.L'),
                  ('left foot IK', 'IK-Foot.L' if label == 'Snow' else 'foot_ik.L')]
-        candidates = {p.GetDisplayName(): p for p in stage.Traverse()
-                      if p.GetTypeName() == 'RigExecJoint' and p.GetRelationship('blender:editorFrame')}
+        candidates = {}
+        for prim in stage.Traverse():
+            source_id = prim.GetCustomDataByKey('blender:sourceId')
+            if prim.GetTypeName() == 'RigExecControl' and source_id:
+                name = json.loads(source_id)[-1]
+                opacity = prim.GetAttribute('guide:displayOpacity')
+                if name not in candidates or (opacity and (opacity.Get() or 0) > 0):
+                    candidates[name] = prim
     else:
         names = [('body (feet remain constrained)', 'M_Body'), ('left hand IK', 'L_ArmIK'),
                  ('left foot IK', 'L_LegIK')]
@@ -138,7 +148,20 @@ def testUsdviewInputFunction(app):
     for workload, name in names:
         prim = candidates.get(name)
         if not prim:
-            report['drags'].append({'workload': workload, 'error': 'control missing', 'passed': False})
+            diagnostics = stage.GetDefaultPrim().GetAttribute('blender:diagnostics').Get() or []
+            sources = [p for p in stage.Traverse()
+                       if p.GetTypeName() == 'RigExecJoint'
+                       and p.GetCustomDataByKey('blender:id')
+                       and json.loads(p.GetCustomDataByKey('blender:id'))[-1] == name]
+            unavailable = [(p, 'bone control is read-only in standard usdRig interaction: '
+                            + p.GetCustomDataByKey('blender:id')) for p in sources]
+            unavailable = [(p, reason) for p, reason in unavailable if reason in diagnostics]
+            if blender and unavailable:
+                source, reason = unavailable[0]
+                report['drags'].append({'workload': workload, 'source': str(source.GetPath()),
+                                        'status': 'unavailable', 'reason': reason})
+            else:
+                report['drags'].append({'workload': workload, 'error': 'control missing', 'passed': False})
             save(); continue
         api.dataModel.selection.setPrim(prim)
         controller.SetTool(gizmoUI.TOOL_TRANSLATE)
@@ -277,23 +300,26 @@ def testUsdviewInputFunction(app):
                       parity_passed=not reference.get('geometry_errors'),
                       reference_geometry_errors=reference.get('geometry_errors', []),
                       skipped_controls=reference.get('skipped_controls', []))
-        providers, meshes = {}, {}
+        providers, edit_providers, meshes = {}, {}, {}
         for prim in stage.Traverse():
             ident = prim.GetCustomDataByKey('blender:id')
             if ident and prim.IsA(UsdGeom.Mesh):
                 meshes[ident] = prim
             elif ident and prim.GetTypeName() in {'RigExecJoint', 'RigExecControl'}:
                 providers[ident] = prim
-        initial = {(edit['id'], edit['channel']): providers[edit['id']].GetAttribute('avars:' + edit['channel']).Get()
+                control = prim.GetRelationship('blender:channelControl')
+                targets = control.GetTargets() if control else []
+                edit_providers[ident] = stage.GetPrimAtPath(targets[0]) if len(targets) == 1 else prim
+        initial = {(edit['id'], edit['channel']): edit_providers[edit['id']].GetAttribute('avars:' + edit['channel']).Get()
                    for sample in reference['poses'] for edit in sample['edits']}
         baseline = {}
         api.dataModel.selection.clearPrims(); app._processEvents()
         for index, sample in enumerate(reference['poses']):
             with Sdf.ChangeBlock():
                 for (ident, name), value in initial.items():
-                    providers[ident].GetAttribute('avars:' + name).Set(value)
+                    edit_providers[ident].GetAttribute('avars:' + name).Set(value)
                 for edit in sample['edits']:
-                    providers[edit['id']].GetAttribute('avars:' + edit['channel']).Set(edit['value'])
+                    edit_providers[edit['id']].GetAttribute('avars:' + edit['channel']).Set(edit['value'])
             assert handle.SetTime(float(api.frame.GetValue())) == 0, 'Viewport evaluation failed'
             app._processEvents(); view.updateGL(); app._processEvents()
             result = compare_pose(sample, reference, reference_path, providers, meshes,
@@ -326,7 +352,10 @@ def testUsdviewInputFunction(app):
             if index in (0, 1, 2, 10):
                 view.grabFramebuffer().save(str(output / (label + '-pose-%02d.png' % index)))
         handle.WriteProfileSummary(str(output / (label + '-reference-poses.tsv')))
-    report['interaction_passed'] = all(row['passed'] for row in report['drags'])
+    attempted = [row for row in report['drags'] if row.get('status') != 'unavailable']
+    report['interaction_passed'] = bool(attempted) and all(row.get('passed', False) for row in attempted)
+    report['unavailable_workloads'] = [row['workload'] for row in report['drags']
+                                       if row.get('status') == 'unavailable']
     report['completed'] = True
     report['source_layer_unchanged'] = report['stage_sha256'] == hashlib.sha256(Path(stage.GetRootLayer().realPath).read_bytes()).hexdigest()
     save()

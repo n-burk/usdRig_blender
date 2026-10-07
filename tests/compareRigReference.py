@@ -134,6 +134,13 @@ def main():
             meshes[ident] = prim
         elif prim.GetTypeName() in {"RigExecJoint", "RigExecControl"}:
             providers[ident] = prim
+    controls = {}
+    for ident, provider in providers.items():
+        relation = provider.GetRelationship("blender:channelControl")
+        targets = relation.GetTargets() if relation else []
+        controls[ident] = stage.GetPrimAtPath(targets[0]) if len(targets) == 1 else provider
+        if not controls[ident]:
+            raise RuntimeError(f"missing native channel control for {ident}")
     stage.SetEditTarget(stage.GetSessionLayer())
     report = {"stage": str(args.stage.resolve()), "source": reference["source"],
         "run_id": os.environ.get("USDBLENDERRIG_VALIDATION_RUN"),
@@ -153,15 +160,15 @@ def main():
         for sample in reference["poses"]:
             for edit in sample["edits"]:
                 key = (edit["id"], edit["channel"])
-                initial_channels[key] = providers[edit["id"]].GetAttribute("avars:" + edit["channel"]).Get()
+                initial_channels[key] = controls[edit["id"]].GetAttribute("avars:" + edit["channel"]).Get()
     for sample_index, sample in enumerate(reference["poses"]):
         if args.incremental:
             for (ident, channel), value in initial_channels.items():
-                providers[ident].GetAttribute("avars:" + channel).Set(value)
+                controls[ident].GetAttribute("avars:" + channel).Set(value)
         else:
             stage.GetSessionLayer().Clear()
         for edit in sample["edits"]:
-            providers[edit["id"]].GetAttribute("avars:" + edit["channel"]).Set(edit["value"])
+            controls[edit["id"]].GetAttribute("avars:" + edit["channel"]).Set(edit["value"])
         pose = rig.evaluate(-1)
         def read_points(prim):
             moved = pose.moved_property(str(prim.GetPath()) + ".points")

@@ -58,20 +58,18 @@ Use the installed resource directory
 `build/install/lib/usd/usdBlenderRig/resources` when deploying the sidecar.
 USD and RigExec shared libraries must remain discoverable by the platform
 loader. After installing this sidecar, launch `bin/usdview.sh character.usdz`.
-This loads the SDK selected by CMake and the Blender control companion together.
+This loads the SDK selected by CMake and the sidecar's native computations.
 The configured SDK prefix is recorded in `build/rigexec-prefix`; set
 `USDBLENDERRIG_RIGEXEC_PREFIX` to override it when testing another installation.
-The companion maps shape selections to their owning bones and uses native
-evaluated bone frames when converting gizmo drags into Blender pose channels.
-Static converted rigs skip background warming of identical frames; live drag
-evaluation remains enabled, and authored avar animation restores normal warming.
+Picker selection and gizmo edits use the stock usdRig viewer. Reconvert older
+exports to obtain the native picker controls; removing the companion alone does
+not change controls already authored in an older USD layer.
 
 The sibling `usdRig_ios` build includes this sidecar's `nativeFrames.cpp` and
 `nativeSkin.cpp` in its native runtime and embeds the `UsdBlenderRig` schema
 resources. Rebuild that runtime before opening exported USDC/USDZ rigs on iOS;
-the mobile viewer does not need Blender to evaluate them. Its gizmo uses the
-published `blender:editorFrame` contract for editable channels, and the picker
-page row scrolls to preserve access to long Rigify/CloudRig page lists.
+the mobile viewer does not need Blender to evaluate them. Its stock usdRig
+picker and gizmo consume the same native control and space switch contract.
 
 ```python
 from pxr import Sdf, Usd
@@ -85,11 +83,13 @@ layer = Sdf.Layer.FindOrOpen("character.blend", {"strict": "1"})
 ```
 
 The source layer is read-only. Pose edits belong in a USD session layer or an
-overlay, or in the exported USD. Controls/joints expose `avars:tx`, `avars:ry`,
-`avars:sx`, etc. `blender:id` custom data identifies the original object/bone;
-display names preserve Blender names, while prim identifiers use compact labels
-with deterministic collision suffixes. Bone custom shapes are display-only child
-controls named `Display`.
+overlay, or in the exported USD. An editable Blender bone has a native
+`/Rig/Controls/<name>/Control` prim with nine TRS avars. Its original
+`RigExecJoint` remains the evaluated bone and exposes `blender:channelControl`
+to locate the editable prim. `blender:id` identifies the original object/bone;
+`blender:sourceId` identifies its channel control. Display names preserve Blender
+names, while prim identifiers use compact labels with deterministic collision
+suffixes. Controls with same-source custom shapes carry those guides directly.
 
 For a reusable Blender-free snapshot:
 
@@ -112,7 +112,7 @@ reads still need Blender; their `complete` flag is false.
 | --- | --- |
 | Active scene's object hierarchy | Nested `RigExecControl` providers under `/Rig/Dag`; parent-inverse placement becomes `rest:space`, saved object basis becomes editable TRS avars |
 | Armature bones, head frames and roll | Nested `RigExecJoint` providers; local bind matrices preserve bone orientation and length metadata |
-| Saved bone pose | Source translation/scale and XYZ rotation avars; other source rotation modes are converted to XYZ |
+| Saved bone pose | Native `RigExecControl` TRS avars drive the original Blender bone computation through standard USD connections; a native `RigExecSpaceSwitch` follows a neutral Blender parent frame and keeps the control editable in stock usdRig viewers |
 | Bone inheritance | Full, none, average, aligned, fix-shear and legacy-none scale modes, optional rotation inheritance and nonlocal translation through native Exec expressions |
 | Object bone parenting | Tail-relative or relative-rest parenting, following native bone pose |
 | Copy Location | Native expression stacks with influence, WORLD/POSE/LOCAL/CUSTOM owner and target spaces, LOCAL_OWNER_ORIENT targets, axis masks, inversion, offset and simple bone head/tail targets; CUSTOM uses a live object or bone frame |
@@ -131,16 +131,28 @@ reads still need Blender; their `complete` flag is false.
 | Meshes | `UsdGeomMesh` control cages with `subdivisionScheme = "catmullClark"` assumed for every mesh, asset-space bind points, extent, render-active face-varying `st` and all named UV sets; editing/render UV selection metadata is retained |
 | Constant topology modifiers | Pre-deformation Mirror and nonsmooth vertex-group Mask materialized on undeformed bind data; no pose or shape-key geometry captured |
 | Unskinned meshes | Native matrix mover following the owning object control |
-| Bone custom shapes | Mesh-edge or POLY-curve guides, source shape transforms, rest-bone size, alternate shape bone, source colors/visibility and thin hairline drawing; helper geometry is omitted |
+| Bone custom shapes | Same-source mesh-edge or POLY-curve guides live on the editable control; alternate-source shapes remain visual, source-following `Display` prims and are diagnosed as read-only |
 | Materials | `UsdPreviewSurface` color, opacity, roughness, metallic, emission and tangent normals; packed/file/UDIM images, named UVs and supported static texture arithmetic are converted to portable PNG assets |
 | Material slots | Whole-mesh binding or material face subsets |
-| Rigify UI collections | Native `RigExecPicker` pages in source UI row order, including hidden collections, with bone selection buttons |
-| CloudRig UI panels and collections | Every stored panel, conditional binding and nested/hidden collection preserved; native selection buttons target the corresponding bones |
+| Rigify UI collections | Native `RigExecPicker` pages in source UI row order, including hidden collections; supported buttons select native controls |
+| CloudRig UI panels and collections | Stored panel order, conditional bindings and nested/hidden collections are preserved as metadata; supported buttons explicitly say `Select` and target native controls |
 | Linked libraries and file textures | Flattened loaded scene data, anchored asset dependencies; files are referenced rather than copied |
 | Scene units and frame rate | Z-up, meters-per-unit and time-code metadata |
 
 Object channels are captured at the saved frame as editable TRS avars.
-Bone pose channels remain relative to their original bind frames. Translation
+Eligible bone controls compose native translation, XYZ rotation and scale over
+an exact neutral Blender frame. The original joints retain the Blender bone
+and constraint evaluation, so skins and downstream bones read the same bone
+providers. The native control displays the pre-constraint edit frame when its
+bone has an output constraint. Connected bones, nonlocal translation, and
+non-FULL or disabled rotation inheritance under a bone parent cannot currently
+be factored into that ordinary control composition. They retain evaluated
+bone providers but receive an explicit read-only diagnostic. Extra native
+configuration channels such as `avars:rspin`, rotation order, rotation sign
+and unit scale do not map to Blender bone behavior; animate the nine exported
+TRS channels with XYZ rotation. The converter fixes each control's default
+space through a standard connection, so stock Pivot editing is refused while
+Pose editing remains available. Translation
 does not export animation curves; all animation/driver/NLA data is diagnosed.
 Prim names use compact Blender labels truncated to 32 characters. Numeric
 starts receive an `n_` prefix; duplicate or sanitized labels receive
@@ -172,8 +184,12 @@ The content-addressed cache defaults to `~/Library/Caches/usdBlenderRig`;
 Rigify/CloudRig sidebar data is adapted to a three-column native picker layout.
 All source pages are retained, including hidden and empty collections. CloudRig
 panels retain their order, labels, nested conditional branches and property
-bindings as inert metadata; buttons select the associated controls. Source
-settings switches and Python operators are not executable picker actions.
+bindings as inert metadata. A supported binding is labelled `Select <name>` and
+selects the associated native controls; it does not change the source setting.
+If any member of a button is unsupported, the whole button is dimmed and
+labelled `(unavailable)`, with no target, so a group never selects only part
+of its source set. Source settings switches and Python operators are diagnosed
+and are not executable picker actions.
 Embedded UI text is preserved without running it. Separate third-party picker
 formats are not currently imported.
 
@@ -234,8 +250,9 @@ never saved by the reader. These controls follow Blender's documented
 strict mode, native types, duplicate IDs, malformed topology, hierarchy and
 constraint cycles, missing/duplicate picker owners and control targets,
 failure atomicity and USDA serialization.
-`evaluation` tests native control → constraint → mixed-weight skin deformation
-and reset. `blenderFixture` creates a compressed real Blender rig with rolled
+`evaluation` tests native control → constraint → mixed-weight skin deformation,
+reset, and live native T/R/S control-frame agreement across parent edits and a
+constrained parent. `blenderFixture` creates a compressed real Blender rig with rolled
 bones, distinct mesh/armature placements, UVs, materials and a custom shape.
 `blenderParity` compares saved pose, translated control, bone rotation, bone
 scale and reset against independently evaluated Blender mesh points, then
