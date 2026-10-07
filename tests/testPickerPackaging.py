@@ -57,11 +57,12 @@ def main():
                     if target.GetCustomDataByKey('blender:sourceId'):
                         assert target.GetTypeName() == 'RigExecControl'
                         actual_id = target.GetCustomDataByKey('blender:sourceId')
-                        assert path in native_switch_targets
+                        spaces = target.GetRelationship("rigExec:channelSpaces").GetTargets()
+                        assert path in native_switch_targets or len(spaces) == 2
                         assert all(target.GetAttribute('avars:' + channel)
                                    for channel in ('tx', 'ty', 'tz', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'))
                         posed = target.GetAttribute('posed:space')
-                        assert not posed or not posed.HasAuthoredConnections(), path
+                        assert spaces or not posed or not posed.HasAuthoredConnections(), path
                     else:
                         actual_id = target.GetCustomDataByKey('blender:id')
                     actual_ids.append(actual_id)

@@ -12,6 +12,7 @@ import sys
 
 import bpy
 from mathutils import Euler, Matrix, Vector
+from mathutils.bvhtree import BVHTree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from materials import Textures, extract as extract_material
 
@@ -176,6 +177,75 @@ def bind_mesh(obj):
         bpy.data.meshes.remove(raw)
 
 
+def surface_deform_skin(obj, mesh, modifier):
+    """Transfer a bound cage's bone weights to a Surface Deform mesh.
+
+    This preserves the cage's rigid/root motion and gives the teeth their
+    deforming bone hierarchy. Nearest cage triangles approximate Blender's
+    Surface Deform bind weights for local, nonrigid cage motion.
+    """
+    target = modifier.target
+    if not modifier.is_bound or not target or target.type != "MESH" or modifier.strength != 1:
+        return None
+    active = [m for m in target.modifiers if m.show_viewport]
+    if len(active) != 1 or active[0].type != "ARMATURE":
+        return None
+    armature = active[0]
+    if not armature.object or armature.use_bone_envelopes or not armature.use_vertex_groups or armature.vertex_group:
+        return None
+    cage = target.data
+    groups = {group.index: group.name for group in target.vertex_groups}
+    weighted = {groups[g.group] for v in cage.vertices for g in v.groups if g.weight > 0 and g.group in groups}
+    palette = [bone for bone in armature.object.data.bones if bone.use_deform and bone.name in weighted]
+    if not palette or not cage.polygons:
+        return None
+    indices = {bone.name: i for i, bone in enumerate(palette)}
+    cage_weights = []
+    for vertex in cage.vertices:
+        row = {indices[groups[g.group]]: float(g.weight) for g in vertex.groups
+               if g.group in groups and groups[g.group] in indices and g.weight > 0}
+        total = sum(row.values())
+        if total <= 1e-8:
+            return None
+        cage_weights.append({i: weight / total for i, weight in row.items()})
+    positions = [target.matrix_world @ vertex.co for vertex in cage.vertices]
+    triangles = []
+    for polygon in cage.polygons:
+        corners = list(polygon.vertices)
+        triangles.extend((corners[0], corners[i], corners[i + 1])
+                         for i in range(1, len(corners) - 1))
+    if not triangles:
+        return None
+    bvh = BVHTree.FromPolygons(positions, triangles, all_triangles=True)
+    rows = []
+    for vertex in mesh.vertices:
+        nearest, _, triangle_index, _ = bvh.find_nearest(obj.matrix_world @ vertex.co)
+        if nearest is None:
+            return None
+        a, b, c = (positions[index] for index in triangles[triangle_index])
+        v0, v1, v2 = b - a, c - a, nearest - a
+        d00, d01, d11 = v0.dot(v0), v0.dot(v1), v1.dot(v1)
+        d20, d21 = v2.dot(v0), v2.dot(v1)
+        denominator = d00 * d11 - d01 * d01
+        if abs(denominator) < 1e-14:
+            return None
+        wb = (d11 * d20 - d01 * d21) / denominator
+        wc = (d00 * d21 - d01 * d20) / denominator
+        weights = {}
+        for index, barycentric in zip(triangles[triangle_index], (1 - wb - wc, wb, wc)):
+            for bone_index, weight in cage_weights[index].items():
+                weights[bone_index] = weights.get(bone_index, 0.0) + barycentric * weight
+        total = sum(max(0.0, weight) for weight in weights.values())
+        if total <= 1e-8:
+            return None
+        rows.append([[index, max(0.0, weight) / total] for index, weight in sorted(weights.items())
+                     if weight > 1e-8])
+    return {"influences": [bone_id(armature.object, bone.name) for bone in palette],
+            "weights": rows, "method": "classicLinear", "mask": [], "use_base_input": False,
+            "source": {"type": "SURFACE_DEFORM", "target": object_id(target),
+                       "approximation": "nearest cage triangle bone weights"}}
+
+
 def snapshot():
     scene = bpy.context.scene
     bpy.context.view_layer.update()
@@ -229,7 +299,9 @@ def snapshot():
                     "use_make_uniform", "use_add", "power", "euler_order", "remove_target_shear",
                     "rest_length", "bulge", "volume", "keep_axis", "track_axis", "use_bbone_shape",
                     "use_bulge_min", "use_bulge_max", "bulge_min", "bulge_max", "bulge_smooth",
-                    "use_limit_x", "use_limit_y", "use_limit_z"):
+                    "use_limit_x", "use_limit_y", "use_limit_z",
+                    "y_scale_mode", "xz_scale_mode", "use_curve_radius",
+                    "use_even_divisions", "use_chain_offset"):
             if hasattr(con, key):
                 item[key] = getattr(con, key)
         pole = getattr(con, "pole_target", None)
@@ -240,6 +312,22 @@ def snapshot():
 
     textures = Textures(dependencies)
     shape_objects = {p.custom_shape for o in objects if o.type == "ARMATURE" for p in o.pose.bones if p.custom_shape}
+
+    guide_extents = {}
+
+    def guide_width(pb):
+        armature = pb.id_data
+        key = object_id(armature)
+        if key not in guide_extents:
+            bones = [b for b in armature.data.bones if b.use_deform] or list(armature.data.bones)
+            points = [p for b in bones for p in (b.head_local, b.tail_local)]
+            guide_extents[key] = max((max(p[a] for p in points) - min(p[a] for p in points)
+                                     for a in range(3)), default=pb.bone.length)
+        # Blender widths are screen pixels; native guide widths are scene units.
+        # A thin diameter relative to the character makes Hydra curves pickable
+        # without scaling the width by a large root-control shape.
+        pixels = float(getattr(pb, "custom_shape_wire_width", 1))
+        return max(guide_extents[key], 1e-6) * 0.001 * max(pixels, 0.5)
 
     def guide(pb):
         shape = pb.custom_shape
@@ -272,7 +360,7 @@ def snapshot():
         return {"guide_points": [list(p) for line in lines for p in line],
                 "guide_counts": [len(line) for line in lines],
                 "guide_source": bone_id(pb.id_data, pb.custom_shape_transform.name) if pb.custom_shape_transform else "",
-                "guide_wire_width": 0.0, "source_wire_width_pixels": float(getattr(pb, "custom_shape_wire_width", 1)),
+                "guide_wire_width": guide_width(pb), "source_wire_width_pixels": float(getattr(pb, "custom_shape_wire_width", 1)),
                 "guide_color": rgb}
 
     for obj in objects:
@@ -303,9 +391,20 @@ def snapshot():
             warn("parent outside active scene saved as independent world placement: " + obj.name)
             local, parent = obj.matrix_world.copy(), ""
             pose, object_basis = [0, 0, 0, 0, 0, 0, 1, 1, 1], False
-        nodes.append({"id": oid, "name": obj.name, "kind": "control", "parent": parent,
-                      "rest": matrix(local), "pose": pose, "pose_is_object_basis": object_basis,
-                      "visible": obj.visible_get(), "render_visible": not obj.hide_render, "object_type": obj.type})
+        node = {"id": oid, "name": obj.name, "kind": "control", "parent": parent,
+                "rest": matrix(local), "pose": pose, "pose_is_object_basis": object_basis,
+                "visible": obj.visible_get(), "render_visible": not obj.hide_render, "object_type": obj.type}
+        if obj.type == "CURVE" and len(obj.data.splines) == 1:
+            spline = obj.data.splines[0]
+            hooks = [mod for mod in obj.modifiers if mod.show_viewport and mod.type == "HOOK"]
+            if spline.type == "BEZIER" and len(spline.bezier_points) == 3 and len(hooks) == 3:
+                ordered = sorted(hooks, key=lambda mod: min(mod.vertex_indices, default=-1))
+                if all(mod.object and mod.object.type == "ARMATURE" and mod.subtarget in mod.object.data.bones
+                       and sorted(mod.vertex_indices) == list(range(3 * i, 3 * i + 3))
+                       for i, mod in enumerate(ordered)):
+                    node["spline_hooks"] = [bone_id(mod.object, mod.subtarget) for mod in ordered]
+                    node["spline_radii"] = [float(point.radius) for point in spline.bezier_points]
+        nodes.append(node)
         for con in obj.constraints:
             constraint(oid, con)
         if obj.type == "ARMATURE":
@@ -326,6 +425,7 @@ def snapshot():
                         "length": float(bone.length), "deform": bone.use_deform,
                         "visible": obj.visible_get() and not bone.hide and (not bone.collections or any(c.is_visible_effectively for c in bone.collections))}
                 node["bbone_segments"] = bone.bbone_segments
+                node["ik_stretch"] = float(pb.ik_stretch)
                 node["armature"] = oid
                 node.update(inherit_scale=bone.inherit_scale, inherit_rotation=bone.use_inherit_rotation,
                             local_location=bone.use_local_location, connected=bone.use_connect)
@@ -346,13 +446,20 @@ def snapshot():
         mesh, prepared = bind_mesh(obj)
         active_modifiers = [mod for mod in obj.modifiers if mod.show_viewport]
         armatures = [mod for mod in active_modifiers if mod.type == "ARMATURE" and mod.object]
+        surface_skin = None
+        if not armatures:
+            surfaces = [mod for mod in active_modifiers if mod.type == "SURFACE_DEFORM"]
+            if len(surfaces) == 1 and active_modifiers[0] == surfaces[0]:
+                surface_skin = surface_deform_skin(obj, mesh, surfaces[0])
         for mod in active_modifiers:
             if mod.name in prepared:
                 # Parameters stay in sourceData; topology is the bind mesh.
                 continue
             if mod.type == "SUBSURF" and mod.levels == 0:
                 continue
-            if mod.type != "ARMATURE":
+            if mod.type == "SURFACE_DEFORM" and surface_skin is not None:
+                warn("Surface Deform uses approximate cage bone weights: " + obj.name + "/" + mod.name)
+            elif mod.type != "ARMATURE":
                 warn("modifier is not translated: " + obj.name + "/" + mod.name + " (" + mod.type + ")")
             elif not mod.object:
                 warn("armature modifier has no object: " + obj.name + "/" + mod.name)
@@ -392,6 +499,8 @@ def snapshot():
                 skins.append(skin)
                 if mod.use_deform_preserve_volume:
                     warn("preserve-volume skinning mapped to native DQ; Blender scale and bend parity is not established: " + obj.name)
+        if surface_skin is not None:
+            skins.append(surface_skin)
         uv = []
         render_uv = next((layer for layer in mesh.uv_layers if layer.active_render), mesh.uv_layers.active)
         if render_uv:

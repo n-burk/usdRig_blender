@@ -35,8 +35,9 @@ string(APPEND _types ",\"RigExecBlenderArmatureParent\":{\"bases\":[\"UsdTyped\"
 string(APPEND _types ",\"RigExecBlenderSkinInfluence\":{\"bases\":[\"UsdTyped\"],\"schemaIdentifier\":\"RigExecBlenderSkinInfluence\",\"schemaKind\":\"concreteTyped\"}")
 string(APPEND _types ",\"RigExecBlenderBoneFrame\":{\"bases\":[\"UsdTyped\"],\"schemaIdentifier\":\"RigExecBlenderBoneFrame\",\"schemaKind\":\"concreteTyped\"}")
 string(APPEND _types ",\"RigExecBlenderCopyTransforms\":{\"bases\":[\"UsdTyped\"],\"schemaIdentifier\":\"RigExecBlenderCopyTransforms\",\"schemaKind\":\"concreteTyped\"}")
+string(APPEND _types ",\"RigExecBlenderMappedFrame\":{\"bases\":[\"UsdTyped\"],\"schemaIdentifier\":\"RigExecBlenderMappedFrame\",\"schemaKind\":\"concreteTyped\"}")
 string(APPEND _types ",\"RigExecBlenderConstraintFrame\":{\"bases\":[\"UsdTyped\"],\"schemaIdentifier\":\"RigExecBlenderConstraintFrame\",\"schemaKind\":\"concreteTyped\"}")
-set(_info "\"RigExecMoverPlugin\":2,\"Exec\":{\"Schemas\":{\"RigExecBlenderArmatureParent\":{},\"RigExecBlenderSkinInfluence\":{},\"RigExecBlenderBoneFrame\":{},\"RigExecBlenderCopyTransforms\":{},\"RigExecBlenderConstraintFrame\":{}}},\"Types\":{${_types}}")
+set(_info "\"RigExecMoverPlugin\":2,\"Exec\":{\"Schemas\":{\"RigExecBlenderArmatureParent\":{},\"RigExecBlenderSkinInfluence\":{},\"RigExecBlenderBoneFrame\":{},\"RigExecBlenderCopyTransforms\":{},\"RigExecBlenderMappedFrame\":{},\"RigExecBlenderConstraintFrame\":{}}},\"Types\":{${_types}}")
 file(GENERATE OUTPUT "${_resources}/plugInfo.json" CONTENT
     "{\"Plugins\":[{\"Type\":\"library\",\"Name\":\"usdBlenderRig\",\"Root\":\"..\",\"LibraryPath\":\"$<TARGET_FILE:usdBlenderRig>\",\"ResourcePath\":\"resources\",\"Info\":{${_info}}}]}")
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/install/plugInfo.json" CONTENT

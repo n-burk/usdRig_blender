@@ -7,6 +7,23 @@
 
 PXR_NAMESPACE_USING_DIRECTIVE
 
+extern "C" int UsdBlenderRigView_ReadGuideFrame(
+    long long stageCacheId, const char *primPath, double frame, int isDefault,
+    double *out)
+{
+    if (!primPath || !out) return 0;
+    auto context = rigExec::RigExecImagingRegistry::ForStageCacheId(stageCacheId, false);
+    if (!context) return 0;
+    const auto snapshot = context->GetStore()->Get();
+    const auto time = isDefault ? UsdTimeCode::Default() : UsdTimeCode(frame);
+    if (!snapshot || !snapshot->Describes(context->GetBoundStage(), time)) return 0;
+    const auto entry = snapshot->prims.find(SdfPath(primPath));
+    if (entry == snapshot->prims.end() || !entry->second.hasControlGuide) return 0;
+    auto matrix = GfMatrix4d(1.0).SetScale(entry->second.controlGuideScale) * entry->second.controlGuideFrame;
+    for (int r=0;r<4;++r) for(int c=0;c<4;++c) out[r*4+c]=matrix[r][c];
+    return 1;
+}
+
 extern "C" int UsdBlenderRigView_ReadPoints(
     long long stageCacheId, const char *primPath, double frame, int isDefault,
     float *out, int maxPoints)

@@ -82,6 +82,38 @@ int main(int argc,char **argv) {
         withPicker["nodes"]=JsValue(pickerNodes);
         auto pickerLayer=SdfLayer::CreateAnonymous("picker.blendrig",{{"strict","1"}});
         CHECK(pickerLayer->ImportFromString(JsWriteToString(JsValue(withPicker))));
+        auto withIk=withPicker;
+        auto ikConstraints=withIk["constraints"].GetJsArray();
+        JsObject ik{{"owner",JsValue("Tip")},{"source",JsValue("Driver")},
+                    {"name",JsValue("Arm IK")},{"type",JsValue("IK")},
+                    {"enabled",JsValue(true)},{"influence",JsValue(1.0)},
+                    {"owner_space",JsValue("WORLD")},{"target_space",JsValue("WORLD")},
+                    {"chain_count",JsValue(2)},{"use_stretch",JsValue(true)},
+                    {"pole",JsValue("Driver")}};
+        ikConstraints.push_back(JsValue(ik));withIk["constraints"]=JsValue(ikConstraints);
+        auto ikLayer=SdfLayer::CreateAnonymous("ik.blendrig");
+        CHECK(ikLayer->ImportFromString(JsWriteToString(JsValue(withIk))));
+        auto ikStage=UsdStage::Open(ikLayer);int hiddenTips=0,ikSolvers=0;
+        for(const auto &prim:ikStage->Traverse()) {
+            if(prim.GetTypeName()==TfToken("RigExecSingleChainIkConstraint")) {
+                SdfPathVector ends;
+                CHECK(prim.GetRelationship(TfToken("rigExec:endJoint")).GetTargets(&ends));
+                CHECK(ends.size()==1);
+                if(ends.size()==1) {
+                    const auto endpoint=ikStage->GetPrimAtPath(ends.front());
+                    CHECK(endpoint);
+                    double radius=-1;float opacity=-1;
+                    CHECK(endpoint.GetAttribute(TfToken("guide:radius")).Get(&radius));CHECK(radius==0);
+                    CHECK(endpoint.GetAttribute(TfToken("guide:displayOpacity")).Get(&opacity));CHECK(opacity==0);
+                    ++hiddenTips;
+                }
+                TfToken mode;float stretch=-1;
+                CHECK(prim.GetAttribute(TfToken("rigExec:poleVectorMode")).Get(&mode));CHECK(mode==TfToken("object"));
+                CHECK(prim.GetAttribute(TfToken("inputs:stretch")).Get(&stretch));CHECK(stretch==0);
+                ++ikSolvers;
+            }
+        }
+        CHECK(hiddenTips==1);CHECK(ikSolvers==1);
         auto pickerStage=UsdStage::Open(pickerLayer); int pickerButtons=0;
         int editableBones=0;
         for(const auto &prim:pickerStage->Traverse()) {
@@ -156,13 +188,17 @@ int main(int argc,char **argv) {
         SdfPathVector inactiveTargets;
         auto inactiveRelation=inactive.GetRelationship(TfToken("rigExec:picker:controls"));
         if(inactiveRelation) inactiveRelation.GetTargets(&inactiveTargets);
-        CHECK(inactiveTargets.empty());
+        CHECK(inactiveTargets.size()==2);
+        auto connectedControl=unavailableStage->GetPrimAtPath(inactiveTargets.front());
+        SdfPathVector spaces;
+        CHECK(connectedControl.GetRelationship(TfToken("rigExec:channelSpaces")).GetTargets(&spaces));
+        CHECK(spaces.size()==2);
+        bool translationEnabled=true;
+        CHECK(connectedControl.GetAttribute(TfToken("rigExec:translationEnabled")).Get(&translationEnabled));
+        CHECK(!translationEnabled);
+        CHECK(connectedControl.GetAttribute(TfToken("posed:space")).HasAuthoredConnections());
         std::string inactiveLabel; CHECK(inactive.GetAttribute(TfToken("ui:text")).Get(&inactiveLabel));
-        CHECK(inactiveLabel=="Root (unavailable)");
-        CHECK(inactive.GetCustomDataByKey(TfToken("blender:unavailable")).Get<bool>());
-        auto unavailableStrict=SdfLayer::CreateAnonymous("unavailable-strict.blendrig",{{"strict","1"}});
-        { TfErrorMark errors; CHECK(!unavailableStrict->ImportFromString(JsWriteToString(JsValue(unavailable))));
-          CHECK(!errors.IsClean()); errors.Clear(); }
+        CHECK(inactiveLabel=="Root");
         auto inertBinding=withPicker;
         auto bindingButton=button; bindingButton["controls"]=JsValue(JsArray{});
         bindingButton["source"]=JsValue(JsObject{{"binding",JsValue(JsObject{{"operator",JsValue("toggle")}})}});

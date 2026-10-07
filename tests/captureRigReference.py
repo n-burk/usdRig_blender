@@ -90,6 +90,14 @@ def main():
         ("jaw rotation", ("jaw_master", "Jaw", "jaw"), "rotate"),
         ("torso rotation", ("torso", "TORSO-Spine", "IK-CTR-Spine"), "rotate"),
     ]
+    if "Tail-SPIK03" in controls:
+        preferred.append(("tail tip translation", ("Tail-SPIK03",), "translate"))
+    if "Eye.L" in controls:
+        preferred.append(("left eye rotation", ("Eye.L",), "rotate"))
+        preferred.append(("left eye target translation", ("Eye.L",), "translate_fine"))
+    if "Eyelid_Master.T.L" in controls:
+        preferred.append(("left upper eyelid rotation", ("Eyelid_Master.T.L",), "rotate"))
+        preferred.append(("left upper eyelid translation", ("Eyelid_Master.T.L",), "translate_fine"))
     state = {pb.name: pb.matrix_basis.copy() for pb in rig.pose.bones}
     driver_inventory = []
     for obj in scene.objects:
@@ -150,8 +158,9 @@ def main():
             continue
         reset()
         pb = controls[chosen]
-        if operation == "translate":
-            offset = extent * (0.08 if chosen != "root" else 0.12)
+        if operation.startswith("translate"):
+            offset = extent * (0.01 if operation == "translate_fine" else
+                               0.08 if chosen != "root" else 0.12)
             pb.location.x += offset
         else:
             t, q, s = pb.matrix_basis.decompose()

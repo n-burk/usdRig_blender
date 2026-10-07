@@ -76,6 +76,13 @@ class RigExecBlenderCopyTransforms "RigExecBlenderCopyTransforms" {
     rel rigExec:source
     rel rigExec:poseInputs
 }
+class RigExecBlenderMappedFrame "RigExecBlenderMappedFrame" {
+    matrix4d outputs:matrix = ((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))
+    matrix4d inputs:targetRest = ((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))
+    matrix4d inputs:sourceRest = ((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))
+    rel rigExec:source
+    rel rigExec:poseInputs
+}
 class RigExecBlenderSkinInfluence "RigExecBlenderSkinInfluence" {
     matrix4d outputs:matrix = ((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))
     matrix4d inputs:inverseBind = ((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))
@@ -109,6 +116,7 @@ class RigExecBlenderArmatureParent "RigExecBlenderArmatureParent" {
     rel rigExec:poseInputs
 }
 class RigExecBlenderBoneFrame "RigExecBlenderBoneFrame" {
+    uniform token inputs:spaceKind = "pose"
     matrix4d outputs:matrix = ((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))
     matrix4d inputs:local = ((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))
     matrix4d inputs:parentRest = ((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))

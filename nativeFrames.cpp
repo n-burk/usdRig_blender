@@ -28,6 +28,7 @@ TF_DEFINE_PRIVATE_TOKENS(_armature,
 );
 TF_DEFINE_PRIVATE_TOKENS(_bone,
     ((matrix,"outputs:matrix")) ((local,"inputs:local"))
+    ((spaceKind,"inputs:spaceKind"))
     ((parentRest,"inputs:parentRest")) ((hasParent,"inputs:hasParent"))
     ((inheritRotation,"inputs:inheritRotation")) ((inheritScale,"inputs:inheritScale"))
     ((localLocation,"inputs:localLocation")) ((connected,"inputs:connected"))
@@ -42,6 +43,11 @@ TF_DEFINE_PRIVATE_TOKENS(_skin,
     ((followOnly,"inputs:followOnly"))
     ((owner,"rigExec:owner")) ((source,"rigExec:source"))
     ((sourceObject,"rigExec:sourceObject")) (computePointFrame)
+);
+TF_DEFINE_PRIVATE_TOKENS(_mapped,
+    ((matrix,"outputs:matrix")) ((targetRest,"inputs:targetRest"))
+    ((sourceRest,"inputs:sourceRest")) ((source,"rigExec:source"))
+    (computePointFrame)
 );
 TF_DEFINE_PRIVATE_TOKENS(_constraint,
     ((matrix,"outputs:matrix")) ((incoming,"inputs:incoming")) ((origin,"inputs:origin"))
@@ -180,6 +186,9 @@ GfMatrix4d BoneFrame(const VdfContext &ctx) {
         FrameMatrix(ctx.GetInputValuePtr<rigExec::RigExecPointFrame>(_bone->parent))*object.GetInverse(),
         ctx.GetInputValue<bool>(_bone->hasParent),ctx.GetInputValue<TfToken>(_bone->inheritScale).GetString(),
         ctx.GetInputValue<bool>(_bone->inheritRotation),ctx.GetInputValue<bool>(_bone->localLocation));
+    const auto kind=ctx.GetInputValue<TfToken>(_bone->spaceKind);
+    if(kind==TfToken("rotation")) return spaces.rotationScale*object;
+    if(kind==TfToken("translation")) return spaces.location*object;
     return spaces.Apply(channels)*object;
 }
 ParentSpaces ConstraintParentSpaces(const VdfContext &ctx,bool source,const GfMatrix4d &object) {
@@ -200,6 +209,11 @@ GfMatrix4d SkinInfluence(const VdfContext &ctx) {
     return prefix*FrameMatrix(ctx.GetInputValuePtr<rigExec::RigExecPointFrame>(_skin->sourceObject)).GetInverse()*
         ctx.GetInputValue<GfMatrix4d>(_skin->inverseBind)*
         FrameMatrix(ctx.GetInputValuePtr<rigExec::RigExecPointFrame>(_skin->source));
+}
+GfMatrix4d MappedFrame(const VdfContext &ctx) {
+    return ctx.GetInputValue<GfMatrix4d>(_mapped->targetRest)*
+        ctx.GetInputValue<GfMatrix4d>(_mapped->sourceRest).GetInverse()*
+        FrameMatrix(ctx.GetInputValuePtr<rigExec::RigExecPointFrame>(_mapped->source));
 }
 GfMatrix4d CopyTransforms(const VdfContext &ctx) {
     auto result=FrameMatrix(ctx.GetInputValuePtr<rigExec::RigExecPointFrame>(_armature->source));
@@ -544,7 +558,7 @@ EXEC_REGISTER_COMPUTATIONS_FOR_SCHEMA(RigExecBlenderArmatureParent) {
 }
 EXEC_REGISTER_COMPUTATIONS_FOR_SCHEMA(RigExecBlenderBoneFrame) {
     self.AttributeExpression(_bone->matrix).Callback<GfMatrix4d>(&BoneFrame)
-        .Inputs(Prim().AttributeValue<GfMatrix4d>(_bone->local),Prim().AttributeValue<GfMatrix4d>(_bone->parentRest),
+        .Inputs(Prim().AttributeValue<TfToken>(_bone->spaceKind),Prim().AttributeValue<GfMatrix4d>(_bone->local),Prim().AttributeValue<GfMatrix4d>(_bone->parentRest),
             Prim().AttributeValue<bool>(_bone->hasParent),Prim().AttributeValue<bool>(_bone->inheritRotation),
             Prim().AttributeValue<bool>(_bone->localLocation),Prim().AttributeValue<bool>(_bone->connected),Prim().AttributeValue<TfToken>(_bone->inheritScale),
             Prim().AttributeValue<double>(_bone->tx),Prim().AttributeValue<double>(_bone->ty),Prim().AttributeValue<double>(_bone->tz),
@@ -552,4 +566,10 @@ EXEC_REGISTER_COMPUTATIONS_FOR_SCHEMA(RigExecBlenderBoneFrame) {
             Prim().AttributeValue<double>(_bone->sx),Prim().AttributeValue<double>(_bone->sy),Prim().AttributeValue<double>(_bone->sz),
             Prim().Relationship(_bone->parent).TargetedObjects<rigExec::RigExecPointFrame>(_bone->computePointFrame).InputName(_bone->parent),
             Prim().Relationship(_bone->object).TargetedObjects<rigExec::RigExecPointFrame>(_bone->computePointFrame).InputName(_bone->object));
+}
+EXEC_REGISTER_COMPUTATIONS_FOR_SCHEMA(RigExecBlenderMappedFrame) {
+    self.AttributeExpression(_mapped->matrix).Callback<GfMatrix4d>(&MappedFrame)
+        .Inputs(Prim().AttributeValue<GfMatrix4d>(_mapped->targetRest),
+            Prim().AttributeValue<GfMatrix4d>(_mapped->sourceRest),
+            Prim().Relationship(_mapped->source).TargetedObjects<rigExec::RigExecPointFrame>(_mapped->computePointFrame).InputName(_mapped->source));
 }

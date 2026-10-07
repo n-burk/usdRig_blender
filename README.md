@@ -89,7 +89,20 @@ overlay, or in the exported USD. An editable Blender bone has a native
 to locate the editable prim. `blender:id` identifies the original object/bone;
 `blender:sourceId` identifies its channel control. Display names preserve Blender
 names, while prim identifiers use compact labels with deterministic collision
-suffixes. Controls with same-source custom shapes carry those guides directly.
+suffixes. Custom shapes live on the editable control. An alternate Blender
+shape-transform bone is retained as `guide:source`, so drawing follows that
+bone while viewport picking and the picker select the animation control.
+
+Controller wires have a positive diameter derived from the deforming armature
+extent and Blender's source pixel width. The original pixel width is retained
+as metadata. Legacy snapshots with zero wire width use the same extent rule.
+Generated IK endpoint joints have their guides hidden, so their schema-default
+radius cannot cover the character. Texture file attributes carry the authored
+color space as metadata in addition to the UsdUVTexture input.
+Generated rigs opt into usdRig connected-pose seed reuse. Their declared
+provider and attribute inputs allow refreshes to pin current dependency frames
+while avoiding repeated invalidation of the whole execution network. The
+runtime preserves complete override reads for rigs that do not opt in.
 
 For a reusable Blender-free snapshot:
 
@@ -112,7 +125,7 @@ reads still need Blender; their `complete` flag is false.
 | --- | --- |
 | Active scene's object hierarchy | Nested `RigExecControl` providers under `/Rig/Dag`; parent-inverse placement becomes `rest:space`, saved object basis becomes editable TRS avars |
 | Armature bones, head frames and roll | Nested `RigExecJoint` providers; local bind matrices preserve bone orientation and length metadata |
-| Saved bone pose | Native `RigExecControl` TRS avars drive the original Blender bone computation through standard USD connections; a native `RigExecSpaceSwitch` follows a neutral Blender parent frame and keeps the control editable in stock usdRig viewers |
+| Saved bone pose | Native `RigExecControl` TRS avars drive the original Blender bone computation through standard USD connections; a native `RigExecSpaceSwitch` or explicit `rigExec:channelSpaces` preserves the Blender channel bases for manipulation |
 | Bone inheritance | Full, none, average, aligned, fix-shear and legacy-none scale modes, optional rotation inheritance and nonlocal translation through native Exec expressions |
 | Object bone parenting | Tail-relative or relative-rest parenting, following native bone pose |
 | Copy Location | Native expression stacks with influence, WORLD/POSE/LOCAL/CUSTOM owner and target spaces, LOCAL_OWNER_ORIENT targets, axis masks, inversion, offset and simple bone head/tail targets; CUSTOM uses a live object or bone frame |
@@ -124,14 +137,17 @@ reads still need Blender; their `complete` flag is false.
 | Limit Rotation | World stacks with influence and all angle limits disabled, reproducing Blender's shear removal; enabled angle limits remain unsupported |
 | Armature constraint | World stacks with influence, weighted targets, linear or dual-quaternion blending and rest/current pivots, without envelopes; preserves owner avars and live armature placement. B-Bone targets use the whole-bone frame with an explicit segment-binding diagnostic |
 | Constraint order and dependencies | Source stack order, parent-before-child dependencies, explicit cycle rejection |
-| IK without stretch/rotation targeting | `RigExecSingleChainIkConstraint`, optional pole provider and a virtual bone-tail joint; solver equivalence diagnosed |
+| IK without rotation targeting | `RigExecSingleChainIkConstraint`, object-pole mode, bone-basis pole angle and a hidden virtual bone-tail joint; the constraint stretch flag and per-bone stretch values are retained; nonuniform stretch and solver equivalence are diagnosed |
+| Three-hook Spline IK | A native `RigExecSplineIk` follows the three hooked bone controls and maps its virtual chain back to the Blender bones. Hooked Bezier shape, twist and scale are approximate; other Spline IK configurations remain diagnosed |
+| Connected lower-limb IK chains with inert native targets | The translator probes a foot IK control, then maps its affected connected deformation bones through calibrated native source frames. This preserves the saved pose while restoring foot-driven mesh motion; Stretch To length and volume remain approximate |
 | Armature vertex-group skinning | `RigExecSkinMover`, used deform-bone palette, normalized weights, live mesh/armature spaces, zero-weight vertices following their owning object |
 | Masked/chained armatures | Native `RigExecBlenderArmatureMover` revisions; fractional/inverted masks and original-input caching for contiguous multi-modifier chains |
+| Bound Surface Deform over an armature cage | Cage bone weights transferred from the nearest cage triangle to the driven mesh, then evaluated with native skinning. Root motion follows the rig; local nonrigid Surface Deform behavior is approximate and diagnosed |
 | Preserve Volume | Native dual quaternion skinning, with a Blender-parity diagnostic |
 | Meshes | `UsdGeomMesh` control cages with `subdivisionScheme = "catmullClark"` assumed for every mesh, asset-space bind points, extent, render-active face-varying `st` and all named UV sets; editing/render UV selection metadata is retained |
 | Constant topology modifiers | Pre-deformation Mirror and nonsmooth vertex-group Mask materialized on undeformed bind data; no pose or shape-key geometry captured |
 | Unskinned meshes | Native matrix mover following the owning object control |
-| Bone custom shapes | Same-source mesh-edge or POLY-curve guides live on the editable control; alternate-source shapes remain visual, source-following `Display` prims and are diagnosed as read-only |
+| Bone custom shapes | Mesh-edge or POLY-curve guides live on the editable control; `guide:source` preserves alternate shape-transform bones without creating read-only pick targets |
 | Materials | `UsdPreviewSurface` color, opacity, roughness, metallic, emission and tangent normals; packed/file/UDIM images, named UVs and supported static texture arithmetic are converted to portable PNG assets |
 | Material slots | Whole-mesh binding or material face subsets |
 | Rigify UI collections | Native `RigExecPicker` pages in source UI row order, including hidden collections; supported buttons select native controls |
@@ -145,9 +161,12 @@ an exact neutral Blender frame. The original joints retain the Blender bone
 and constraint evaluation, so skins and downstream bones read the same bone
 providers. The native control displays the pre-constraint edit frame when its
 bone has an output constraint. Connected bones, nonlocal translation, and
-non-FULL or disabled rotation inheritance under a bone parent cannot currently
-be factored into that ordinary control composition. They retain evaluated
-bone providers but receive an explicit read-only diagnostic. Extra native
+non-FULL or disabled rotation inheritance use `rigExec:channelSpaces`: two
+evaluated providers describe the rotation and translation channel bases.
+Their native expression still computes the exact Blender pre-constraint pose
+from the original channel values. Both viewers use those published bases for
+manipulation. Connected bones disable translation while retaining rotation
+and scale, matching their fixed origin in Blender. Extra native
 configuration channels such as `avars:rspin`, rotation order, rotation sign
 and unit scale do not map to Blender bone behavior; animate the nine exported
 TRS channels with XYZ rotation. The converter fixes each control's default
@@ -221,8 +240,7 @@ multi-armature caches following unsupported modifiers, B-Bone segments,
 object vertex parenting, CUSTOM spaces, LOCAL_OWNER_ORIENT owner spaces,
 non-WORLD spaces for non-copy constraints, partial rotation masks, rotation
 offset/inversion/ADD mix modes,
-enabled rotation limits, unsupported constraint types, custom shape
-transform bones, non-POLY curve geometry, custom split normals, and procedural
+enabled rotation limits, unsupported constraint types, non-POLY curve geometry, custom split normals, and procedural
 or packed textures. Rest scale/shear/reflection is retained but diagnosed
 because RigExec orthonormalizes bind frames. Smooth shading requires host normal
 recomputation and is diagnosed. Principled materials are a preview subset;
@@ -410,3 +428,10 @@ byte-for-byte with no authored time samples.
 
 Native numerical conventions and algorithm sources are documented in
 [references](docs/references.md).
+
+`tests/testUsdviewBlenderControls.py` checks hand/foot picker clicks, visible
+curve picking, exact world translation and real gizmo mouse drags. Build
+`usdBlenderRigViewSnapshot`, then run it with the same viewer environment as
+the comparison test. Curves hidden in the Blender source are checked through
+the picker. Channel-space controls require the updated usdRig viewer/runtime
+and regenerated exports on desktop and iOS.

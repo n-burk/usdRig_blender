@@ -40,6 +40,8 @@ def testUsdviewInputFunction(app):
     output = Path(os.environ.get('USDBLENDERRIG_VIEW_PROOF', '/tmp/rig-usdview-comparison'))
     output.mkdir(parents=True, exist_ok=True)
     label = Path(stage.GetRootLayer().realPath).stem.split('_')[0]
+    if label.startswith('Blender-'):
+        label = label[len('Blender-'):]
     report_path = output / (label + '.json')
     report = {'stage': stage.GetRootLayer().realPath,
               'measurement_source': 'usdview stage-scoped immutable Hydra snapshot',
@@ -123,10 +125,49 @@ def testUsdviewInputFunction(app):
     report['snapshot_read_is_read_only'] = True
     save()
 
+    # Use actual Alt-drag events: directly mutating FreeCamera bypasses the
+    # navigation guard and lets synchronous idle warming contaminate timings.
+    camera_before = api.dataModel.viewSettings.freeCamera.clone()
+    generation = handle.GetGeneration()
+    warm_before = handle.GetWarmingCompletedCount()
+    def camera_event(kind, point, button, buttons):
+        local = QtCore.QPointF(*point)
+        event = QtGui.QMouseEvent(kind, local, QtCore.QPointF(view.mapToGlobal(local.toPoint())),
+                                 button, buttons, QtCore.Qt.AltModifier)
+        QtWidgets.QApplication.sendEvent(view, event)
+
+    origin = (view.width() * 0.5, view.height() * 0.5)
+    camera_event(QtCore.QEvent.MouseButtonPress, origin, QtCore.Qt.LeftButton, QtCore.Qt.LeftButton)
+    assert view._dragActive and view._cameraMode == 'tumble'
+    tumble, warmup = [], []
+    try:
+        for step in range(40):
+            point = (origin[0] + (step + 1) * 2 / view.devicePixelRatioF(),
+                     origin[1] + (step + 1) / view.devicePixelRatioF())
+            start = time.perf_counter()
+            camera_event(QtCore.QEvent.MouseMove, point, QtCore.Qt.NoButton, QtCore.Qt.LeftButton)
+            view.updateGL(); app._processEvents()
+            elapsed = (time.perf_counter() - start) * 1000
+            (warmup if step < 10 else tumble).append(elapsed)
+        report['camera_tumble'] = {
+            'input': 'Alt-left mouse drag', 'warmup_samples_ms': warmup, 'samples_ms': tumble,
+            'median_ms': float(np.median(tumble)), 'p95_ms': float(np.percentile(tumble, 95)),
+            'generation_unchanged': handle.GetGeneration() == generation,
+            'warming_completed_during_drag': handle.GetWarmingCompletedCount() - warm_before}
+        assert report['camera_tumble']['generation_unchanged'], 'Camera tumble published a new rig pose'
+        handle.WriteProfileSummary(str(output / (label + '-camera.tsv')))
+    finally:
+        camera_event(QtCore.QEvent.MouseButtonRelease, point, QtCore.Qt.LeftButton, QtCore.Qt.NoButton)
+        api.dataModel.viewSettings.freeCamera = camera_before
+        view.updateGL(); app._processEvents()
+    save()
+
     blender = any(p.GetCustomDataByKey('blender:id') for p in all_meshes)
     if blender:
         names = [('global root', 'root'), ('left hand IK', 'IK-Wrist.L' if label == 'Snow' else 'hand_ik.L'),
                  ('left foot IK', 'IK-Foot.L' if label == 'Snow' else 'foot_ik.L')]
+        if label == 'Gamma':
+            names.append(('tail tip', 'Tail-SPIK03'))
         candidates = {}
         for prim in stage.Traverse():
             source_id = prim.GetCustomDataByKey('blender:sourceId')
@@ -270,6 +311,25 @@ def testUsdviewInputFunction(app):
                                     'uniform_control_delta_error': float(np.linalg.norm(value - before - delta, axis=1).max(initial=0))})
             row.update(control_displacement=delta.tolist(), mesh_motion=mesh_motion,
                        passed=bool(np.linalg.norm(delta) > 1e-5 and all(s['generation_advanced'] and s['native_updates'] for s in row['samples'])))
+            if label == 'Snow' and name == 'root':
+                teeth = {m['path'].rsplit('/', 1)[-1]: m for m in mesh_motion
+                         if m['path'].rsplit('/', 1)[-1] in {
+                             'GEO_snow_teeth_lower', 'GEO_snow_teeth_upper',
+                             'GEO_snow_gums_lower', 'GEO_snow_gums_upper'}}
+                row['teeth_follow_root'] = (len(teeth) == 4 and all(
+                    m['point_source'] == 'published snapshot' and
+                    m['uniform_control_delta_error'] < 1e-4 for m in teeth.values()))
+                row['passed'] &= row['teeth_follow_root']
+            if label == 'Gamma' and name == 'Tail-SPIK03':
+                body = next((m for m in mesh_motion if m['path'] == '/Rig/Geometry/MESH_Gamma'), None)
+                row['tail_mesh_moves'] = bool(body and body['point_source'] == 'published snapshot'
+                                              and body['max_displacement'] > 0.01)
+                row['passed'] &= row['tail_mesh_moves']
+            if label == 'Gamma' and name == 'foot_ik.L':
+                body = next((m for m in mesh_motion if m['path'] == '/Rig/Geometry/MESH_Gamma'), None)
+                row['foot_mesh_moves'] = bool(body and body['point_source'] == 'published snapshot'
+                                              and body['max_displacement'] > 0.01)
+                row['passed'] &= row['foot_mesh_moves']
             for field in ('event_ms', 'input_to_paint_ms', 'native_preview_ms'):
                 values = [s[field] for s in row['samples']]
                 row[field] = {'median': float(np.median(values)), 'p95': float(np.percentile(values, 95)),

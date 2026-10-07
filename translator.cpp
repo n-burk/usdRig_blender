@@ -1,6 +1,7 @@
 #include "translator.h"
 #include "rigExecRigging/rigBuilder.h"
 #include "rigExecRigging/schemaAuthoring.h"
+#include "rigExec/rigEvaluator.h"
 #include "pxr/base/js/json.h"
 #include "pxr/base/gf/vec2f.h"
 #include "pxr/base/gf/vec4f.h"
@@ -162,10 +163,20 @@ public:
     rigExec::RigExecRigBuilder rig=rigExec::RigExecRigBuilder::Create(stage);
     std::map<std::string,Node> nodes;
     std::map<std::string,UsdShadeMaterial> materials;
+    std::map<std::string,double> guideExtents;
     std::vector<std::string> diagnostics,dependencies;
     TfTokenVector operationOrder;
     explicit Importer(JsValue data,std::string origin):scene(std::move(data)),source(std::move(origin)) {}
     void Warn(const std::string &message) { diagnostics.push_back(message); }
+    void AbsolutePoseParent(const UsdPrim &prim) {
+        const auto identity=stage->DefinePrim(SdfPath("/Rig/Mechanisms/identityParent"),TfToken("Scope"));
+        auto matrix=identity.CreateAttribute(TfToken("outputs:matrix"),SdfValueTypeNames->Matrix4d);
+        matrix.Set(GfMatrix4d(1));
+        // A connected parent space is an explicit inheritance boundary in
+        // usdRig, including when its value is identity. A literal identity
+        // leaves namespace propagation enabled and duplicates pose refresh.
+        prim.GetAttribute(TfToken("parent:space")).SetConnections({matrix.GetPath()});
+    }
     Node &Find(const std::string &id) {
         auto it=nodes.find(id);
         if(it==nodes.end()) throw std::runtime_error("unresolved rig node: "+id);
@@ -276,13 +287,9 @@ public:
             // This expression already returns an absolute world frame and
             // explicitly reads its live parent. Namespace pose propagation
             // must stop here; dependency refresh computes inheritance once.
-            stage->GetPrimAtPath(bone.path).GetAttribute(TfToken("parent:space")).Set(GfMatrix4d(1));
+            AbsolutePoseParent(stage->GetPrimAtPath(bone.path));
             stage->GetPrimAtPath(bone.path).GetAttribute(TfToken("posed:space")).SetConnections({mechanism.GetPath().AppendProperty(TfToken("outputs:matrix"))});
-            if(!EditableBoneControl(bone)) {
-                if(Flag(bone.data,"visible",true) || Has(bone.data,"guide_points"))
-                    Warn("bone control is read-only in standard usdRig interaction: "+bone.id);
-                continue;
-            }
+            const bool splitChannels=!EditableBoneControl(bone);
             const SdfPath framePath=SdfPath("/Rig/ControlSpaces").AppendChild(TfToken(bone.name));
             auto frame=rigExec::RigExecSchemaPrim::Define(stage,framePath,TfToken("RigExecControl"));
             frame.SetAttribute(TfToken("rest:space"),VtValue(GfMatrix4d(1)));
@@ -292,7 +299,7 @@ public:
             neutral.SetAttribute(TfToken("inputs:local"),VtValue(bone.rest));
             neutral.SetAttribute(TfToken("inputs:inheritScale"),VtValue(TfToken(mode)));
             neutral.SetAttribute(TfToken("inputs:inheritRotation"),VtValue(Flag(bone.data,"inherit_rotation",true)));
-            neutral.SetAttribute(TfToken("inputs:localLocation"),VtValue(true));
+            neutral.SetAttribute(TfToken("inputs:localLocation"),VtValue(Flag(bone.data,"local_location",true)));
             neutral.SetAttribute(TfToken("inputs:connected"),VtValue(false));
             neutral.SetRelationship(TfToken("rigExec:sourceObject"),{object.path});
             neutral.SetRelationship(TfToken("rigExec:poseInputs"),dependencies);
@@ -315,10 +322,12 @@ public:
             prim.SetDisplayName(Str(bone.data,"name"));
             prim.SetCustomDataByKey(TfToken("blender:sourceId"),VtValue(bone.id));
             UsdGeomImageable(prim).CreatePurposeAttr().Set(UsdGeomTokens->guide);
+            if(!splitChannels) {
             auto spaceSwitch=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("controlSpace_"+bone.name)),TfToken("RigExecSpaceSwitch"));
             spaceSwitch.SetRelationship(TfToken("rigExec:target"),{controlPath});
             spaceSwitch.SetRelationship(TfToken("rigExec:sources"),{framePath});
             spaceSwitch.SetAttribute(TfToken("inputs:activeSpace"),VtValue(0.0));
+            }
             const bool customShape=Has(bone.data,"guide_points") && !Array(Field(bone.data,"guide_points")).empty();
             const bool ownShape=!Has(bone.data,"guide_source") || Str(bone.data,"guide_source").empty() || Str(bone.data,"guide_source")==bone.id;
             control.SetAttribute(TfToken("guide:displayOpacity"),VtValue(Flag(bone.data,"visible",true) && (!customShape || !ownShape) ? 0.8f : 0.0f));
@@ -333,18 +342,70 @@ public:
                 stage->GetPrimAtPath(bone.path).GetAttribute(channel).SetConnections({controlPath.AppendProperty(channel)});
             }
             stage->GetPrimAtPath(bone.path).CreateRelationship(TfToken("blender:channelControl"),true).SetTargets({controlPath});
+            if(splitChannels) {
+                // Publish channel bases independently: Blender inherits location
+                // and rotation/scale through different parent transforms.
+                neutral.SetAttribute(TfToken("inputs:spaceKind"),VtValue(TfToken("rotation")));
+                const auto translationPath=framePath.AppendChild(TfToken("Translation"));
+                auto translation=rigExec::RigExecSchemaPrim::Define(stage,translationPath,TfToken("RigExecControl"));
+                translation.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
+                AbsolutePoseParent(translation.GetPrim());
+                const auto translationExprPath=neutral.GetPath().AppendChild(TfToken("Translation"));
+                auto translationExpr=rigExec::RigExecSchemaPrim::Define(stage,translationExprPath,TfToken("RigExecBlenderBoneFrame"));
+                for(const auto &attr:neutral.GetPrim().GetAuthoredAttributes()) {
+                    VtValue value;
+                    if(attr.Get(&value)) translationExpr.GetPrim().CreateAttribute(attr.GetName(),attr.GetTypeName()).Set(value);
+                }
+                for(const auto &rel:neutral.GetPrim().GetAuthoredRelationships()) {
+                    SdfPathVector targets; rel.GetTargets(&targets);
+                    translationExpr.SetRelationship(rel.GetName(),targets);
+                }
+                translationExpr.SetAttribute(TfToken("inputs:spaceKind"),VtValue(TfToken("translation")));
+                translation.GetPrim().GetAttribute(TfToken("posed:space")).SetConnections({translationExprPath.AppendProperty(TfToken("outputs:matrix"))});
+                control.SetRelationship(TfToken("rigExec:channelSpaces"),{framePath,translationPath});
+                control.SetAttribute(TfToken("rigExec:translationEnabled"),VtValue(!Flag(bone.data,"connected",false)));
+                // The original bone expression consumes these same nine channels.
+                // Its pre-constraint pose is authoritative for the editor too.
+                prim.GetAttribute(TfToken("posed:space")).SetConnections({mechanism.GetPath().AppendProperty(TfToken("outputs:matrix"))});
+            }
             bone.controlPath=controlPath;
             stage->GetPrimAtPath(bone.path).GetAttribute(TfToken("guide:radius")).Set(0.0);
             if(HasActiveConstraint(bone) && customShape && ownShape)
                 Warn("native control guide displays pre-constraint edit frame: "+bone.id);
         }
     }
+    double GuideWidth(const Node &node) {
+        const double authored=Num(node.data,"guide_wire_width",0);
+        if(authored>0) return authored;
+        // Older snapshots authored zero hairline widths. Reconstruct a modest
+        // armature-sized diameter once per armature for native Hydra picking.
+        const std::string armature=Has(node.data,"armature") ? Str(node.data,"armature") : node.id;
+        auto found=guideExtents.find(armature);
+        if(found==guideExtents.end()) {
+            GfVec3d low(std::numeric_limits<double>::max()),high(-std::numeric_limits<double>::max());
+            const auto object=nodes.find(armature);
+            const GfMatrix4d inverse=object==nodes.end() ? GfMatrix4d(1) : object->second.world.GetInverse();
+            bool any=false;
+            for(const auto &entry:nodes) {
+                const auto &bone=entry.second;
+                if(bone.kind!="joint" || !Has(bone.data,"armature") || Str(bone.data,"armature")!=armature ||
+                   !Flag(bone.data,"deform",true)) continue;
+                const auto frame=bone.world*inverse;
+                for(const auto &point:{frame.ExtractTranslation(),frame.Transform(GfVec3d(0,Num(bone.data,"length",1),0))})
+                    for(int axis=0;axis<3;++axis) {low[axis]=std::min(low[axis],point[axis]);high[axis]=std::max(high[axis],point[axis]);}
+                any=true;
+            }
+            const double extent=any ? std::max({high[0]-low[0],high[1]-low[1],high[2]-low[2]}) : Num(node.data,"length",1);
+            found=guideExtents.emplace(armature,std::max(extent,1e-6)).first;
+        }
+        return found->second*0.001*std::max(0.5,Num(node.data,"source_wire_width_pixels",1));
+    }
     void Guides() {
         for(auto &entry:nodes) {
             auto &n=entry.second;
             if(!Has(n.data,"guide_points") || Array(Field(n.data,"guide_points")).empty())continue;
             const bool ownShape=!Has(n.data,"guide_source") || Str(n.data,"guide_source").empty() || Str(n.data,"guide_source")==n.id;
-            if((n.controlPath!=n.path || (n.kind=="control" && !HasActiveConstraint(n))) && ownShape) {
+            if(n.controlPath!=n.path || (n.kind=="control" && !HasActiveConstraint(n) && ownShape)) {
                 auto control=rigExec::RigExecSchemaPrim::Define(stage,n.controlPath,TfToken("RigExecControl"));
                 VtVec3fArray points;VtIntArray counts;size_t total=0;
                 for(const auto &p:Array(Field(n.data,"guide_points")))points.push_back(Point(p));
@@ -353,10 +414,11 @@ public:
                     counts.push_back(count);total+=count;
                 }
                 if(total!=points.size())throw std::runtime_error("guide topology mismatch");
+                if(!ownShape) control.SetRelationship(TfToken("guide:source"),{Find(Str(n.data,"guide_source")).path});
                 control.SetAttribute(TfToken("guide:shape"),VtValue(TfToken("custom")));
                 control.SetAttribute(TfToken("guide:points"),VtValue(points));
                 control.SetAttribute(TfToken("guide:curveVertexCounts"),VtValue(counts));
-                control.SetAttribute(TfToken("guide:wireWidth"),VtValue(Num(n.data,"guide_wire_width",0)));
+                control.SetAttribute(TfToken("guide:wireWidth"),VtValue(GuideWidth(n)));
                 control.SetAttribute(TfToken("guide:displayOpacity"),VtValue(Flag(n.data,"visible",true)?1.0f:0.0f));
                 control.SetAttribute(TfToken("guide:scaleX"),VtValue(1.0));
                 control.SetAttribute(TfToken("guide:scaleY"),VtValue(1.0));
@@ -369,7 +431,7 @@ public:
                 auto expression=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("guide_"+n.name+suffix)),TfToken("RigExecBlenderCopyTransforms"));
                 expression.SetRelationship(TfToken("rigExec:source"),{sourceNode.path});
                 expression.SetRelationship(TfToken("rigExec:poseInputs"),{sourceNode.path});
-                target.SetAttribute(TfToken("parent:space"),VtValue(GfMatrix4d(1)));
+                AbsolutePoseParent(target.GetPrim());
                 target.GetPrim().GetAttribute(TfToken("posed:space")).SetConnections({expression.GetPath().AppendProperty(TfToken("outputs:matrix"))});
             };
             auto guide=rigExec::RigExecSchemaPrim::Define(stage,n.path.AppendChild(TfToken("Display")),TfToken("RigExecControl"));
@@ -386,10 +448,91 @@ public:
             guide.SetAttribute(TfToken("guide:shape"),VtValue(TfToken("custom")));
             guide.SetAttribute(TfToken("guide:points"),VtValue(points));
             guide.SetAttribute(TfToken("guide:curveVertexCounts"),VtValue(counts));
-            guide.SetAttribute(TfToken("guide:wireWidth"),VtValue(Num(n.data,"guide_wire_width",0)));
+            guide.SetAttribute(TfToken("guide:wireWidth"),VtValue(GuideWidth(n)));
             guide.SetAttribute(TfToken("guide:displayOpacity"),VtValue(Flag(n.data,"visible",true)?1.0f:0.0f));
             if(Has(n.data,"guide_color"))guide.SetAttribute(TfToken("guide:displayColor"),VtValue(Point(Field(n.data,"guide_color"))));
         }
+    }
+    bool SplineIk(Node &owner,const JsValue &c,size_t index) {
+        if(owner.kind!="joint" || !Has(owner.data,"armature") || Str(c,"source").empty() ||
+           Number(Field(c,"influence"))!=1 || Num(c,"chain_count",0)<2 ||
+           Str(c,"y_scale_mode")!="FIT_CURVE" || Str(c,"xz_scale_mode")!="NONE" ||
+           !Flag(c,"use_even_divisions",false) || Flag(c,"use_chain_offset",false))return false;
+        auto &curve=Find(Str(c,"source"));
+        if(!Has(curve.data,"spline_hooks") || Array(Field(curve.data,"spline_hooks")).size()!=3 ||
+           !Has(curve.data,"spline_radii"))return false;
+        for(const auto &radius:Array(Field(curve.data,"spline_radii")))
+            if(std::abs(Number(radius)-1)>1e-6)return false;
+        std::vector<Node *> hooks,chain;
+        for(const auto &id:Array(Field(curve.data,"spline_hooks"))) {
+            auto &bone=Find(String(id));
+            if(bone.kind!="joint" || Str(bone.data,"armature")!=Str(owner.data,"armature"))return false;
+            hooks.push_back(&bone);
+        }
+        Node *bone=&owner;
+        const int count=static_cast<int>(Num(c,"chain_count",0));
+        for(int i=0;i<count;++i) {
+            if(bone->kind!="joint" || Str(bone->data,"armature")!=Str(owner.data,"armature"))return false;
+            chain.push_back(bone);
+            if(i+1<count) {
+                if(bone->parent.empty())return false;
+                bone=&Find(bone->parent);
+            }
+        }
+        std::reverse(chain.begin(),chain.end());
+        const auto name="spline_"+std::to_string(index);
+        const auto controlScope=SdfPath("/Rig/SplineControls").AppendChild(TfToken(name));
+        const auto jointScope=SdfPath("/Rig/SplineJoints").AppendChild(TfToken(name));
+        stage->DefinePrim(SdfPath("/Rig/SplineControls"),TfToken("Scope"));
+        stage->DefinePrim(SdfPath("/Rig/SplineJoints"),TfToken("Scope"));
+        stage->DefinePrim(controlScope,TfToken("Scope"));
+        stage->DefinePrim(jointScope,TfToken("Scope"));
+        SdfPathVector controls,joints;
+        for(int i=0;i<3;++i) {
+            auto proxy=rigExec::RigExecSchemaPrim::Define(stage,controlScope.AppendChild(TfToken("Hook"+std::to_string(i))),TfToken("RigExecControl"));
+            proxy.SetAttribute(TfToken("rest:space"),VtValue(hooks[i]->world));
+            proxy.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
+            proxy.GetPrim().GetAttribute(TfToken("posed:space")).SetConnections({hooks[i]->path.AppendProperty(TfToken("posed:space"))});
+            controls.push_back(proxy.GetPath());
+        }
+        std::vector<GfMatrix4d> virtualRests;
+        for(int i=0;i<=count;++i) {
+            auto rest=chain[std::min(i,count-1)]->world;
+            if(i==count)rest.SetTranslateOnly(rest.Transform(GfVec3d(0,Num(owner.data,"length",1),0)));
+            GfVec3d x(rest[1][0],rest[1][1],rest[1][2]);
+            GfVec3d y(-rest[0][0],-rest[0][1],-rest[0][2]);
+            for(int axis=0;axis<3;++axis) {rest[0][axis]=x[axis];rest[1][axis]=y[axis];}
+            auto virtualJoint=rigExec::RigExecSchemaPrim::Define(stage,jointScope.AppendChild(TfToken("Joint"+std::to_string(i))),TfToken("RigExecJoint"));
+            virtualJoint.SetAttribute(TfToken("rest:space"),VtValue(rest));
+            virtualJoint.SetAttribute(TfToken("guide:radius"),VtValue(0.0));
+            virtualJoint.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
+            virtualRests.push_back(rest);joints.push_back(virtualJoint.GetPath());
+        }
+        auto solver=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Solvers").AppendChild(TfToken(name)),TfToken("RigExecSplineIk"));
+        solver.ApplyAPI(TfToken("NodeGraphNodeAPI"));
+        // The stock solver publishes a unit-radius blue guide sphere. Its
+        // three hook controls are the animator-facing guides instead.
+        UsdGeomImageable(solver.GetPrim()).CreateVisibilityAttr().Set(UsdGeomTokens->invisible);
+        solver.SetAttribute(TfToken("guide:radius"),VtValue(0.0));
+        solver.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
+        solver.SetRelationship(TfToken("rigExec:rootControl"),{controls[0]});
+        solver.SetRelationship(TfToken("rigExec:midControl"),{controls[1]});
+        solver.SetRelationship(TfToken("rigExec:endControl"),{controls[2]});
+        solver.SetRelationship(TfToken("rigExec:joints"),joints);
+        solver.SetAttribute(TfToken("inputs:preserveVolume"),VtValue(0.0));
+        solver.SetAttribute(TfToken("inputs:midFollowWeight"),VtValue(0.35));
+        solver.SetAttribute(TfToken("rigExec:restLength"),VtValue(TfToken("curve")));
+        solver.GetPrim().SetCustomDataByKey(TfToken("blender:source"),VtValue(JsWriteToString(c)));
+        for(int i=0;i<count;++i) {
+            auto mapped=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken(name+"_bone_"+std::to_string(i))),TfToken("RigExecBlenderMappedFrame"));
+            mapped.SetAttribute(TfToken("inputs:targetRest"),VtValue(chain[i]->world));
+            mapped.SetAttribute(TfToken("inputs:sourceRest"),VtValue(virtualRests[i]));
+            mapped.SetRelationship(TfToken("rigExec:source"),{joints[i]});
+            mapped.SetRelationship(TfToken("rigExec:poseInputs"),{joints[i]});
+            stage->GetPrimAtPath(chain[i]->path).GetAttribute(TfToken("posed:space")).SetConnections({mapped.GetPath().AppendProperty(TfToken("outputs:matrix"))});
+        }
+        Warn("Spline IK uses native three-control curve; Blender Bezier hook shape and twist may differ: "+owner.id);
+        return true;
     }
     void Constraints() {
         const auto &items=Array(Field(scene,"constraints"));
@@ -415,7 +558,11 @@ public:
             for(size_t index:stacks[owner]) {
                 const auto &c=items[index];
                 const auto src=Str(c,"source");
-                if(!src.empty()) visit(src);
+                if(!src.empty()) {
+                    visit(src);
+                    if(Str(c,"type")=="SPLINE_IK" && Has(Find(src).data,"spline_hooks"))
+                        for(const auto &hook:Array(Field(Find(src).data,"spline_hooks")))visit(String(hook));
+                }
                 if(Has(c,"pole")) visit(Str(c,"pole"));
                 if(Has(c,"custom_space") && !Str(c,"custom_space").empty())visit(Str(c,"custom_space"));
                 if(Str(c,"type")=="ARMATURE" && Has(c,"targets"))
@@ -423,7 +570,9 @@ public:
                         if(Number(Field(target,"weight"))>0 && !Str(target,"source").empty())visit(Str(target,"source"));
             }
             bool native=NativeConstraintStack(Find(owner),stacks[owner],items);
-            if(!native) {
+            const bool hasIk=std::any_of(stacks[owner].begin(),stacks[owner].end(),
+                [&](size_t index){return Str(items[index],"type")=="IK";});
+            if(!native && !hasIk) {
                 // Unimplemented Action/Transform/limit nodes must not erase
                 // the supported Armature parenting in the same stack. Keep
                 // the native subsequence in source order, and diagnose every
@@ -625,6 +774,11 @@ public:
         const std::string sourceId=Str(c,"source");
         if(sourceId.empty()) { Warn("constraint has no source: "+label); return; }
         auto &src=Find(sourceId);
+        if(type=="SPLINE_IK") {
+            if(!first || !SplineIk(owner,c,index))
+                Warn("Spline IK curve/hooks or solver settings are unsupported: "+label);
+            return;
+        }
         if(type=="ARMATURE") {
             bool oneTarget=false;
             if(Has(c,"targets")) {
@@ -689,9 +843,9 @@ public:
             return;
         }
         if(type=="IK") {
-            if(owner.kind!="joint" || !Flag(c,"use_tail",true) || Flag(c,"use_stretch",true) ||
+            if(owner.kind!="joint" || !Flag(c,"use_tail",true) ||
                Flag(c,"use_rotation",false) || !Flag(c,"use_location",true)) {
-                Warn("IK requires tail targeting, location, joint owner and no stretch/rotation: "+label); return;
+                Warn("IK requires tail targeting, location, joint owner and no rotation: "+label); return;
             }
             const int count=Has(c,"chain_count") ? Integer(Field(c,"chain_count")) : 0;
             if(count<0) throw std::runtime_error("negative IK chain length");
@@ -703,14 +857,46 @@ public:
             // inclusive chain ends at a joint origin, so author a virtual tip.
             const SdfPath end=owner.path.AppendChild(TfToken("IkTip_"+std::to_string(index)));
             auto tip=rigExec::RigExecSchemaPrim::Define(stage,end,TfToken("RigExecJoint"));
+            tip.SetAttribute(TfToken("guide:radius"),VtValue(0.0));
+            tip.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
             GfMatrix4d local(1); local.SetTranslate(GfVec3d(0,Num(owner.data,"length",1),0));
             tip.SetAttribute(TfToken("rest:space"),VtValue(local));
             std::vector<SdfPath> poles;
             if(Has(c,"pole")) poles.push_back(Find(Str(c,"pole")).path);
             auto ik=Chain(name).AddSingleChainIkConstraint("solve",first->path,end,src.path,poles);
             ik.SetOrientationMode(TfToken("preserve"));
+            double stretch=0;
+            if(Flag(c,"use_stretch",true)) {
+                std::vector<double> values;
+                for(Node *bone=&owner;;bone=&Find(bone->parent)) {
+                    values.push_back(Num(bone->data,"ik_stretch",0));
+                    if(bone==first)break;
+                }
+                stretch=*std::max_element(values.begin(),values.end());
+                if(std::any_of(values.begin(),values.end(),[&](double value){return value!=stretch;}))
+                    Warn("non-uniform per-bone IK stretch requires a weighted solver: "+label);
+            }
+            ik.GetPrim().GetAttribute(TfToken("inputs:stretch")).Set(static_cast<float>(stretch));
             ik.SetSolverMode(TfToken(poles.empty() ? "singleChain" : "rotatePlane"));
-            ik.SetTwistDegrees(Num(c,"pole_angle",0)*180/3.14159265358979323846);
+            if(!poles.empty()) ik.SetPoleVectorMode(TfToken("object"));
+            // Blender measures pole angle from the root bone's X axis;
+            // native rotate-plane IK measures it from the chain bend plane.
+            double poleOffset=0;
+            if(!poles.empty()) {
+                const auto root=first->world.ExtractTranslation();
+                const auto tipPosition=local.Transform(GfVec3d(0));
+                const auto endPosition=owner.world.Transform(tipPosition);
+                const auto axis=(endPosition-root).GetNormalized();
+                auto x=first->world.TransformDir(GfVec3d(1,0,0)); x-=axis*GfDot(x,axis);
+                Node *second=&owner;
+                while(second!=first && second->parent!=first->id)second=&Find(second->parent);
+                auto bend=second->world.ExtractTranslation()-root; bend-=axis*GfDot(bend,axis);
+                if(bend.GetLength()<1e-8)bend=GfCross(axis,x);
+                if(x.GetLength()>1e-8 && bend.GetLength()>1e-8)
+                    poleOffset=std::atan2(GfDot(GfCross(x.GetNormalized(),bend.GetNormalized()),axis),
+                                         GfDot(x.GetNormalized(),bend.GetNormalized()));
+            }
+            ik.SetTwistDegrees((Num(c,"pole_angle",0)+poleOffset)*180/3.14159265358979323846);
             ik.SetDefaultWeight(static_cast<float>(Number(Field(c,"influence"))));
             Warn("IK uses native RigExec solve; Blender solver/pole-angle equivalence is not established: "+label);
             return;
@@ -796,6 +982,7 @@ public:
                 map.CreateInput(TfToken("file"),SdfValueTypeNames->Asset).Set(SdfAssetPath(Asset(Str(tex,"file"))));
                 map.CreateInput(TfToken("st"),SdfValueTypeNames->Float2).ConnectToSource(reader.CreateOutput(TfToken("result"),SdfValueTypeNames->Float2));
                 map.CreateInput(TfToken("sourceColorSpace"),SdfValueTypeNames->Token).Set(TfToken(Str(tex,"colorspace")));
+                map.GetInput(TfToken("file")).GetAttr().SetColorSpace(TfToken(Str(tex,"colorspace")));
                 map.GetPrim().SetCustomDataByKey(TfToken("blender:source"),VtValue(JsWriteToString(tex)));
                 for(const char *name:{"scale","bias"})if(Has(tex,name)) {
                     const auto &v=Array(Field(tex,name));if(v.size()!=4)throw std::runtime_error("texture scale/bias requires four values");
@@ -1055,6 +1242,97 @@ public:
             }
         }
     }
+    void CalibrateInertLegChains() {
+        struct Candidate { Node *owner; Node *source; std::string side; };
+        std::map<std::string,std::vector<const JsValue *>> stacks;
+        for(const auto &constraint:Array(Field(scene,"constraints")))
+            if(Flag(constraint,"enabled",true) && Number(Field(constraint,"influence"))>0)
+                stacks[Str(constraint,"owner")].push_back(&constraint);
+        std::vector<Candidate> candidates;
+        for(const auto &entry:stacks) {
+            auto &owner=Find(entry.first);
+            if(owner.kind!="joint" || !Flag(owner.data,"connected",false))continue;
+            const auto name=Str(owner.data,"name");
+            const std::string side=name.find(".L")!=std::string::npos ? "L" :
+                name.find(".R")!=std::string::npos ? "R" : "";
+            if(side.empty() || (name.find("thigh")==std::string::npos &&
+                name.find("shin")==std::string::npos && name.find("foot")==std::string::npos &&
+                name.find("toe")==std::string::npos))continue;
+            const auto &first=*entry.second.front();
+            if(Str(first,"type")!="COPY_TRANSFORMS" || Number(Field(first,"influence"))!=1 ||
+               Str(first,"owner_space")!="WORLD" || Str(first,"target_space")!="WORLD")continue;
+            bool onlyCopies=std::all_of(entry.second.begin(),entry.second.end(),[](const JsValue *c){return Str(*c,"type")=="COPY_TRANSFORMS";});
+            if(!std::all_of(entry.second.begin(),entry.second.end(),[](const JsValue *c){
+                    const auto type=Str(*c,"type");return type=="COPY_TRANSFORMS" || type=="STRETCH_TO";
+                }))continue;
+            auto &source=Find(Str(onlyCopies ? *entry.second.back() : first,"source"));
+            if(source.kind=="joint")candidates.push_back({&owner,&source,side});
+        }
+        if(candidates.empty())return;
+        rigExec::RigExecRigEvaluator evaluator(stage,SdfPath("/Rig"));
+        std::vector<std::string> errors;
+        if(!evaluator.Compile(&errors)) {
+            Warn("connected lower-limb calibration skipped: "+(errors.empty()?std::string("native evaluation failed"):errors.front()));
+            return;
+        }
+        const auto baseline=evaluator.Evaluate(UsdTimeCode::Default());
+        if(!baseline.valid) { Warn("connected lower-limb calibration skipped: invalid saved pose");return; }
+        auto matrix=[](const rigExec::RigExecPointFrame &frame) {
+            GfMatrix4d result(1);const auto origin=frame.Origin();
+            const GfVec3d axes[3]={frame.X()-origin,frame.Y()-origin,frame.Z()-origin};
+            for(int i=0;i<3;++i)for(int j=0;j<3;++j)result[i][j]=axes[i][j];
+            result.SetTranslateOnly(origin);return result;
+        };
+        auto frame=[&](const rigExec::RigExecRigPose &pose,const Node &node)->const rigExec::RigExecPointFrame * {
+            auto it=pose.jointFramesFinal.find(node.path);
+            return it==pose.jointFramesFinal.end()?nullptr:&it->second;
+        };
+        std::set<std::pair<std::string,std::string>> inertSides;
+        for(const auto &candidate:candidates) {
+            if(Str(candidate.owner->data,"name")!="ORG-shin."+candidate.side)continue;
+            const auto armature=Str(candidate.owner->data,"armature");
+            auto control=std::find_if(nodes.begin(),nodes.end(),[&](const auto &entry) {
+                const auto &node=entry.second;
+                return node.kind=="joint" && Has(node.data,"armature") &&
+                    Str(node.data,"armature")==armature && Str(node.data,"name")=="foot_ik."+candidate.side;
+            });
+            if(control==nodes.end())continue;
+            auto attr=stage->GetPrimAtPath(control->second.controlPath).GetAttribute(TfToken("avars:tx"));
+            double saved=0;
+            if(!attr || !attr.Get(&saved))continue;
+            stage->SetEditTarget(stage->GetSessionLayer());
+            attr.Set(saved+0.12);
+            const auto moved=evaluator.Evaluate(UsdTimeCode::Default());
+            stage->GetSessionLayer()->Clear();
+            stage->SetEditTarget(stage->GetRootLayer());
+            if(!moved.valid)continue;
+            const auto *owner0=frame(baseline,*candidate.owner),*owner1=frame(moved,*candidate.owner);
+            const auto *source0=frame(baseline,*candidate.source),*source1=frame(moved,*candidate.source);
+            if(!owner0 || !owner1 || !source0 || !source1)continue;
+            auto distance=[](const GfMatrix4d &a,const GfMatrix4d &b) {
+                double result=0;for(int i=0;i<4;++i)for(int j=0;j<4;++j)
+                    result=std::max(result,std::abs(a[i][j]-b[i][j]));return result;
+            };
+            if(distance(matrix(*owner0),matrix(*owner1))<1e-5 &&
+               distance(matrix(*source0),matrix(*source1))>1e-4)
+                inertSides.insert({armature,candidate.side});
+        }
+        for(const auto &candidate:candidates) {
+            if(!inertSides.count({Str(candidate.owner->data,"armature"),candidate.side}))continue;
+            const auto *target=frame(baseline,*candidate.owner),*source=frame(baseline,*candidate.source);
+            if(!target || !source)continue;
+            auto mapped=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(
+                TfToken("calibrated_leg_"+candidate.owner->name)),TfToken("RigExecBlenderMappedFrame"));
+            mapped.SetAttribute(TfToken("inputs:targetRest"),VtValue(matrix(*target)));
+            mapped.SetAttribute(TfToken("inputs:sourceRest"),VtValue(matrix(*source)));
+            mapped.SetRelationship(TfToken("rigExec:source"),{candidate.source->path});
+            mapped.SetRelationship(TfToken("rigExec:poseInputs"),{candidate.source->path});
+            stage->GetPrimAtPath(candidate.owner->path).GetAttribute(TfToken("posed:space")).SetConnections({
+                mapped.GetPath().AppendProperty(TfToken("outputs:matrix"))});
+        }
+        if(!inertSides.empty())
+            Warn("connected lower-limb IK chains use calibrated native frames; Stretch To length/volume remains approximate");
+    }
     SdfLayerRefPtr Run(bool metadataOnly,bool strict) {
         if(Str(scene,"format")!="usdBlenderRig" || Integer(Field(scene,"version"))!=1)
             throw std::runtime_error("unsupported Blender rig snapshot format/version");
@@ -1067,13 +1345,17 @@ public:
         for(const auto &v:Array(Field(scene,"dependencies"))) Asset(String(v));
         if(!metadataOnly) { Graph(); Constraints(); Guides(); Materials(); Geometry(); Pickers(); }
         if(!operationOrder.empty()) stage->GetPrimAtPath(SdfPath("/Rig/Movers")).SetChildrenReorder(operationOrder);
+        auto root=stage->GetPrimAtPath(SdfPath("/Rig"));
+        root.SetCustomDataByKey(TfToken("rigExec:connectedPoseSeedReuse"),VtValue(true));
+        stage->SetDefaultPrim(root);
+        if(!metadataOnly) CalibrateInertLegChains();
         std::sort(diagnostics.begin(),diagnostics.end()); diagnostics.erase(std::unique(diagnostics.begin(),diagnostics.end()),diagnostics.end());
         std::sort(dependencies.begin(),dependencies.end()); dependencies.erase(std::unique(dependencies.begin(),dependencies.end()),dependencies.end());
         if(strict && !diagnostics.empty()) throw std::runtime_error("strict import rejected: "+diagnostics.front());
-        auto root=stage->GetPrimAtPath(SdfPath("/Rig"));
         root.CreateAttribute(TfToken("blender:diagnostics"),SdfValueTypeNames->StringArray,true,SdfVariabilityUniform)
             .Set(VtStringArray(diagnostics.begin(),diagnostics.end()));
         root.SetCustomDataByKey(TfToken("blender:sourceData"),VtValue(JsWriteToString(scene)));
+        root.SetCustomDataByKey(TfToken("rigExec:connectedPoseSeedReuse"),VtValue(true));
         stage->SetDefaultPrim(root);
         auto layer=stage->GetRootLayer();
         layer->SetCustomLayerData({{"blenderRig:source",VtValue(source)},

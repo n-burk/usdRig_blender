@@ -47,6 +47,11 @@ def testUsdviewInputFunction(app):
         asset = shader.GetInput('file').Get()
         assert asset and (asset.resolvedPath or '<UDIM>' in asset.path), str(shader.GetPath())
     report['texture_shaders'] = len(textures)
+    tips = [p for p in stage.Traverse() if p.GetName().startswith('IkTip_')]
+    for tip in tips:
+        assert tip.GetAttribute('guide:radius').Get() == 0
+        assert tip.GetAttribute('guide:displayOpacity').Get() == 0
+    report['hidden_ik_tips'] = len(tips)
     pickers = pickerScene.load_all(stage)
     report['picker_pages'] = sum(len(p.panels) for p in pickers)
     assert report['picker_pages'] > 0
@@ -62,7 +67,8 @@ def testUsdviewInputFunction(app):
     report['control_path'] = str(root.GetPath())
     report['source_path'] = str(source.GetPath())
     assert root.GetAttribute('guide:shape').Get() == 'custom'
-    assert root.GetAttribute('guide:wireWidth').Get() == 0
+    assert root.GetAttribute('guide:wireWidth').Get() > 0
+    report['control_wire_width'] = root.GetAttribute('guide:wireWidth').Get()
     assert root.GetAttribute('guide:points').Get()
     assert not root.GetAttribute('posed:space').HasAuthoredConnections()
     assert root.GetAttribute('default:space').HasAuthoredConnections()

@@ -102,6 +102,36 @@ int main(int argc,char **argv) {
                 for(const auto &name:{"Root","Tip"})
                     sameFrame(pose.controlFrames.at(controlPaths.at(name)),pose.jointFramesBase.at(bonePaths.at(name)));
             }
+            // Every Blender inheritance mode must retain exact channel values
+            // and publish the same pre-constraint pose on its editable control.
+            for(const char *mode:{"FULL","NONE","AVERAGE","ALIGNED","FIX_SHEAR","NONE_LEGACY"})
+            for(bool local:{false,true}) for(bool inherit:{false,true}) for(bool connected:{false,true}) {
+                auto variant=synthetic;
+                auto records=variant.at("nodes").GetJsArray();
+                for(auto &record:records) {
+                    auto n=record.GetJsObject();
+                    if(n.at("id").GetString()=="Tip") {
+                        n["inherit_scale"]=JsValue(mode); n["local_location"]=JsValue(local);
+                        n["inherit_rotation"]=JsValue(inherit); n["connected"]=JsValue(connected);
+                        record=JsValue(n);
+                    }
+                }
+                variant["nodes"]=JsValue(records);
+                auto layer=SdfLayer::CreateAnonymous("channel-spaces.blendrig");
+                CHECK(layer->ImportFromString(JsWriteToString(JsValue(variant))));
+                auto st=UsdStage::Open(layer); CHECK(st);
+                st->SetEditTarget(st->GetSessionLayer());
+                rigExec::RigExecRigEvaluator eval(st,SdfPath("/Rig"));
+                errors.clear(); CHECK(eval.Compile(&errors)); CHECK(errors.empty());
+                for(const auto &edit:std::vector<std::tuple<std::string,std::string,double>>{
+                    {"Root","rz",31.0},{"Root","sx",1.4},{"Root","sy",0.7},
+                    {"Tip","tx",0.3},{"Tip","ry",27.0},{"Tip","sz",1.2}}) {
+                    CHECK(st->GetPrimAtPath(controlPaths.at(std::get<0>(edit)))
+                        .GetAttribute(TfToken("avars:"+std::get<1>(edit))).Set(std::get<2>(edit)));
+                    const auto result=eval.Evaluate(UsdTimeCode::Default()); CHECK(result.valid);
+                    sameFrame(result.controlFrames.at(controlPaths.at("Tip")),result.jointFramesBase.at(bonePaths.at("Tip")));
+                }
+            }
             auto constrained=synthetic;
             auto follow=originalConstraints.front().GetJsObject();
             follow["owner"]=JsValue("Root");
