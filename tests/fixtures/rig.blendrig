@@ -1,0 +1,361 @@
+{
+  "format": "usdBlenderRig",
+  "version": 1,
+  "source": "",
+  "meters_per_unit": 0.01,
+  "fps": 30,
+  "start": 1,
+  "end": 24,
+  "nodes": [
+    {
+      "id": "Master",
+      "name": "Master",
+      "kind": "control",
+      "parent": "",
+      "rest": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "pose": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1
+      ],
+      "length": 1,
+      "visible": true
+    },
+    {
+      "id": "Armature",
+      "name": "Armature",
+      "kind": "control",
+      "parent": "Master",
+      "rest": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "pose": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1
+      ],
+      "length": 1,
+      "visible": true
+    },
+    {
+      "id": "Root",
+      "name": "Root",
+      "kind": "joint",
+      "parent": "Armature",
+      "rest": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "pose": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1
+      ],
+      "length": 1,
+      "visible": true
+    },
+    {
+      "id": "Tip",
+      "name": "Tip",
+      "kind": "joint",
+      "parent": "Root",
+      "rest": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        1,
+        0,
+        1
+      ],
+      "pose": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1
+      ],
+      "length": 1,
+      "visible": true
+    },
+    {
+      "id": "Driver",
+      "name": "Driver",
+      "kind": "control",
+      "parent": "Master",
+      "rest": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        1,
+        0,
+        1
+      ],
+      "pose": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1
+      ],
+      "length": 1,
+      "visible": true
+    },
+    {
+      "id": "Body",
+      "name": "Body",
+      "kind": "control",
+      "parent": "Master",
+      "rest": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "pose": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1
+      ],
+      "length": 1,
+      "visible": true
+    }
+  ],
+  "constraints": [
+    {
+      "owner": "Tip",
+      "source": "Driver",
+      "name": "Follow",
+      "type": "COPY_LOCATION",
+      "enabled": true,
+      "influence": 1,
+      "owner_space": "WORLD",
+      "target_space": "WORLD"
+    }
+  ],
+  "meshes": [
+    {
+      "id": "Body",
+      "points": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ]
+      ],
+      "counts": [
+        4
+      ],
+      "indices": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "uv": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          0,
+          1
+        ]
+      ],
+      "smooth": [
+        false
+      ],
+      "materials": [
+        "Blue"
+      ],
+      "material_indices": [
+        0
+      ],
+      "skin": {
+        "influences": [
+          "Root",
+          "Tip"
+        ],
+        "weights": [
+          [
+            [
+              0,
+              1
+            ]
+          ],
+          [
+            [
+              0,
+              1
+            ]
+          ],
+          [
+            [
+              1,
+              1
+            ]
+          ],
+          [
+            [
+              0,
+              0.5
+            ],
+            [
+              1,
+              0.5
+            ]
+          ]
+        ],
+        "method": "classicLinear"
+      }
+    }
+  ],
+  "materials": [
+    {
+      "id": "Blue",
+      "color": [
+        0.1,
+        0.3,
+        0.8,
+        1
+      ],
+      "roughness": 0.5,
+      "metallic": 0,
+      "texture": ""
+    }
+  ],
+  "dependencies": [],
+  "diagnostics": []
+}
