@@ -17,7 +17,7 @@ import sys
 import time
 
 import numpy as np
-from pxr import Sdf, UsdGeom
+from pxr import Plug, Sdf, UsdGeom
 from pxr.Usdviewq.qt import QtCore, QtGui, QtWidgets
 
 
@@ -33,7 +33,12 @@ def testUsdviewInputFunction(app):
     assert 'usdBlenderRigUsdview' not in sys.modules
 
     sys.path.insert(0, str(Path.cwd() / 'tests'))
-    from compareRigReference import compare_pose
+    from compareRigReference import compare_pose, resolve_edit_attribute
+    if os.environ.get('USDBLENDERRIG_REQUIRE_CORE_ONLY') == '1':
+        from checkStockControlRuntime import loaded_libraries
+        assert Plug.Registry().GetPluginWithName('usdBlenderRig') is None
+        assert not any(Path(path).name in {'libusdBlenderRig.dylib', 'libusdBlenderRig.so', 'usdBlenderRig.dll'}
+                       for path in loaded_libraries())
 
     api = app._usdviewApi
     stage = api.stage
@@ -168,6 +173,9 @@ def testUsdviewInputFunction(app):
                  ('left foot IK', 'IK-Foot.L' if label == 'Snow' else 'foot_ik.L')]
         if label == 'Gamma':
             names.append(('tail tip', 'Tail-SPIK03'))
+        elif label == 'Ellie':
+            names = [('global root', 'root'), ('left hand IK', 'IK-MSTR-Wrist.L'),
+                     ('left foot IK', 'IK-MSTR-Foot.L')]
         candidates = {}
         for prim in stage.Traverse():
             source_id = prim.GetCustomDataByKey('blender:sourceId')
@@ -209,7 +217,9 @@ def testUsdviewInputFunction(app):
         controller.SetOrientation(gizmoSettings.ORIENT_WORLD)
         app._processEvents()
         target = controller.Target()
-        row = {'workload': workload, 'control': str(prim.GetPath()), 'samples': [], 'release_ms': []}
+        row = {'workload': workload, 'control': str(prim.GetPath()), 'samples': [],
+               'release_ms': [], 'release_handler_ms': [], 'release_phases_ms': [],
+               'release_ui_max_gap_ms': [], 'release_checks': []}
         if not target or target.Advisory():
             row.update(error=target.Advisory() if target else 'No target', passed=False)
             report['drags'].append(row); save(); continue
@@ -296,10 +306,61 @@ def testUsdviewInputFunction(app):
                               'origin': frame(prim)[3, :3].tolist()}
                     if gesture >= 2:
                         row['samples'].append(sample)
-                unused, release_ms = send(QtCore.QEvent.MouseButtonRelease, end_point, QtCore.Qt.LeftButton, QtCore.Qt.NoButton)
+                phases = {}
+                patched = []
+                preview_frame = frame(prim).copy()
+                preview_generation = handle.GetGeneration()
+                undo_count = len(controller.undoStack._undo)
+
+                def instrument(obj, method, phase):
+                    original = getattr(obj, method)
+                    def measured(*args, **kwargs):
+                        started = time.perf_counter()
+                        try:
+                            return original(*args, **kwargs)
+                        finally:
+                            phases[phase] = phases.get(phase, 0.0) + (time.perf_counter() - started) * 1000
+                    setattr(obj, method, measured)
+                    patched.append((obj, method, original))
+
+                instrument(channel, 'End', 'preview_end')
+                instrument(controller._drag.target.writer, 'CommitToStage', 'stage_commit')
+                instrument(controller._drag.recorder, 'Commit', 'undo_commit')
+                instrument(controller, '_RebuildHandles', 'handle_refresh')
+                pulse_times = [time.perf_counter()]
+                pulse = QtCore.QTimer()
+                pulse.setInterval(5)
+                pulse.timeout.connect(lambda: pulse_times.append(time.perf_counter()))
+                pulse.start()
+                try:
+                    release_handler_ms, release_ms = send(QtCore.QEvent.MouseButtonRelease, end_point, QtCore.Qt.LeftButton, QtCore.Qt.NoButton)
+                    # Include delayed callbacks: a fast handler followed by
+                    # a blocking zero-timer still stalls the interface.
+                    until = pulse_times[0] + 0.5
+                    while time.perf_counter() < until:
+                        app._processEvents()
+                        time.sleep(0.001)
+                    pulse_times.append(time.perf_counter())
+                finally:
+                    pulse.stop()
+                    for obj, method, original in reversed(patched):
+                        setattr(obj, method, original)
                 assert not controller.IsDragging()
+                release_check = {
+                    'gesture': gesture,
+                    'pose_error': float(np.abs(frame(prim) - preview_frame).max()),
+                    'generation_unchanged': handle.GetGeneration() == preview_generation,
+                    'one_undo_entry': len(controller.undoStack._undo) == min(
+                        undo_count + 1, controller.undoStack.LIMIT)}
+                row['release_checks'].append(release_check)
+                assert release_check['pose_error'] < 2e-5, release_check
+                assert release_check['one_undo_entry'], release_check
                 if gesture >= 2:
                     row['release_ms'].append(release_ms)
+                    row['release_handler_ms'].append(release_handler_ms)
+                    row['release_phases_ms'].append(phases)
+                    row['release_ui_max_gap_ms'].append(max(
+                        (b - a) * 1000 for a, b in zip(pulse_times, pulse_times[1:])))
                 print(label, workload, 'gesture', gesture, 'complete', flush=True)
             delta = frame(prim)[3, :3] - initial_frame[3, :3]
             mesh_motion = []
@@ -311,6 +372,16 @@ def testUsdviewInputFunction(app):
                                     'uniform_control_delta_error': float(np.linalg.norm(value - before - delta, axis=1).max(initial=0))})
             row.update(control_displacement=delta.tolist(), mesh_motion=mesh_motion,
                        passed=bool(np.linalg.norm(delta) > 1e-5 and all(s['generation_advanced'] and s['native_updates'] for s in row['samples'])))
+            if label == 'Ellie' and name == 'root':
+                facial_names = {'GEO_ellie_eye_L', 'GEO_ellie_eye_R',
+                                'GEO_ellie_eye_highlights', 'GEO_ellie_eyebrows',
+                                'GEO_ellie_eyelashes', 'GEO_ellie_head'}
+                facial = {m['path'].rsplit('/', 1)[-1]: m for m in mesh_motion
+                          if m['path'].rsplit('/', 1)[-1] in facial_names}
+                row['facial_geometry_follows_root'] = (len(facial) == len(facial_names) and all(
+                    m['point_source'] == 'published snapshot' and
+                    m['uniform_control_delta_error'] < 2e-5 for m in facial.values()))
+                row['passed'] &= row['facial_geometry_follows_root']
             if label == 'Snow' and name == 'root':
                 teeth = {m['path'].rsplit('/', 1)[-1]: m for m in mesh_motion
                          if m['path'].rsplit('/', 1)[-1] in {
@@ -370,16 +441,19 @@ def testUsdviewInputFunction(app):
                 control = prim.GetRelationship('blender:channelControl')
                 targets = control.GetTargets() if control else []
                 edit_providers[ident] = stage.GetPrimAtPath(targets[0]) if len(targets) == 1 else prim
-        initial = {(edit['id'], edit['channel']): edit_providers[edit['id']].GetAttribute('avars:' + edit['channel']).Get()
-                   for sample in reference['poses'] for edit in sample['edits']}
+        initial = {}
+        for sample in reference['poses']:
+            for edit in sample['edits']:
+                attribute = resolve_edit_attribute(edit, edit_providers, meshes)
+                initial[attribute.GetPath()] = (attribute, attribute.Get())
         baseline = {}
         api.dataModel.selection.clearPrims(); app._processEvents()
         for index, sample in enumerate(reference['poses']):
             with Sdf.ChangeBlock():
-                for (ident, name), value in initial.items():
-                    edit_providers[ident].GetAttribute('avars:' + name).Set(value)
+                for attribute, value in initial.values():
+                    attribute.Set(value)
                 for edit in sample['edits']:
-                    edit_providers[edit['id']].GetAttribute('avars:' + edit['channel']).Set(edit['value'])
+                    resolve_edit_attribute(edit, edit_providers, meshes).Set(edit['value'])
             assert handle.SetTime(float(api.frame.GetValue())) == 0, 'Viewport evaluation failed'
             app._processEvents(); view.updateGL(); app._processEvents()
             result = compare_pose(sample, reference, reference_path, providers, meshes,
@@ -417,7 +491,14 @@ def testUsdviewInputFunction(app):
     report['unavailable_workloads'] = [row['workload'] for row in report['drags']
                                        if row.get('status') == 'unavailable']
     report['completed'] = True
+    if os.environ.get('USDBLENDERRIG_REQUIRE_CORE_ONLY') == '1':
+        assert Plug.Registry().GetPluginWithName('usdBlenderRig') is None
+        assert not any(Path(path).name in {'libusdBlenderRig.dylib', 'libusdBlenderRig.so', 'usdBlenderRig.dll'}
+                       for path in loaded_libraries())
+        report['converter_plugin_absent'] = True
+        report['loaded_runtime_libraries'] = loaded_libraries()
     report['source_layer_unchanged'] = report['stage_sha256'] == hashlib.sha256(Path(stage.GetRootLayer().realPath).read_bytes()).hexdigest()
     save()
-    assert report['interaction_passed'], 'One or more viewport drags failed; see ' + str(report_path)
+    if not poses_only:
+        assert report['interaction_passed'], 'One or more viewport drags failed; see ' + str(report_path)
     print(label, 'viewport comparison completed; parity', report.get('parity_passed', 'no Blender reference'), flush=True)

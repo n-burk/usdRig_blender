@@ -3,6 +3,7 @@
 blender --background --factory-startup --disable-autoexec --python-exit-code 1
         --python tests/captureRigReference.py -- source.blend output-directory
 """
+import argparse
 import json
 import math
 from pathlib import Path
@@ -66,18 +67,39 @@ def mesh_arrays(obj, depsgraph):
 
 
 def main():
-    source, output = sys.argv[sys.argv.index("--") + 1:]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source")
+    parser.add_argument("output")
+    parser.add_argument("--include-mesh", action="append", default=[],
+                        help="Also measure a named hidden dependency mesh")
+    parser.add_argument("--jaw-sweep", action="store_true",
+                        help="Capture additional jaw angles and a combined root/head/jaw edit")
+    parser.add_argument("--shape-key", nargs=2, action="append", default=[], metavar=("MESH", "KEY"),
+                        help="Capture the named shape channel at 0, 0.5, and 1")
+    parser.add_argument("--control", nargs=2, action="append", default=[], metavar=("NAME", "OPERATION"),
+                        help="Also capture a named control using translate, translate_fine, or rotate")
+    args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:])
+    source, output = args.source, args.output
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.open_mainfile(filepath=str(Path(source).resolve()), load_ui=False, use_scripts=False)
     scene = bpy.context.scene
     bpy.context.view_layer.update()
     objects = render_objects()
+    for name in args.include_mesh:
+        obj = bpy.data.objects.get(name)
+        if obj is None or obj.type != "MESH":
+            parser.error("requested dependency mesh is missing: " + name)
+        if obj not in objects:
+            objects.append(obj)
     armatures = sorted([obj for obj in scene.objects if obj.type == "ARMATURE"], key=object_id)
     # The user-facing rig has the most custom shape controls; meta rigs are
     # generally hidden and are used for construction rather than posing.
     rig = max(armatures, key=lambda obj: (obj.visible_get(), sum(bool(pb.custom_shape) for pb in obj.pose.bones)))
     controls = {pb.name: pb for pb in rig.pose.bones if pb.custom_shape}
+    for name,operation in args.control:
+        if name not in controls or operation not in {"translate","translate_fine","rotate"}:
+            parser.error("requested control or operation is unsupported: " + name + "/" + operation)
     preferred = [
         ("global translation", ("root", "Root"), "translate"),
         ("left hand IK", ("hand_ik.L", "IK-Wrist.L"), "translate"),
@@ -90,6 +112,7 @@ def main():
         ("jaw rotation", ("jaw_master", "Jaw", "jaw"), "rotate"),
         ("torso rotation", ("torso", "TORSO-Spine", "IK-CTR-Spine"), "rotate"),
     ]
+    preferred.extend(("requested control " + name,(name,),operation) for name,operation in args.control)
     if "Tail-SPIK03" in controls:
         preferred.append(("tail tip translation", ("Tail-SPIK03",), "translate"))
     if "Eye.L" in controls:
@@ -98,7 +121,26 @@ def main():
     if "Eyelid_Master.T.L" in controls:
         preferred.append(("left upper eyelid rotation", ("Eyelid_Master.T.L",), "rotate"))
         preferred.append(("left upper eyelid translation", ("Eyelid_Master.T.L",), "translate_fine"))
+    # Exercise both lattice Hook deformation and movement of its parent frame.
+    # These optional controls are present on Ellie; other rigs retain their
+    # existing capture set.
+    for name in ("LTC-FannyPack_Bag", "LTC-FannyPack_Bag_Top"):
+        if name in controls:
+            preferred.append(("bag lattice translation", (name,), "translate_fine"))
+            parent = "ROOT-" + name
+            if parent in controls:
+                preferred.append(("bag lattice parent rotation", (parent,), "rotate"))
     state = {pb.name: pb.matrix_basis.copy() for pb in rig.pose.bones}
+    shape_channels = []
+    for mesh_name, key_name in args.shape_key:
+        obj = bpy.data.objects.get(mesh_name)
+        keys = obj.data.shape_keys if obj and obj.type == "MESH" else None
+        key = keys.key_blocks.get(key_name) if keys else None
+        if key is None:
+            parser.error("requested shape key is missing: " + mesh_name + "/" + key_name)
+        shape_channels.append((obj, key, key.value))
+        if obj not in objects:
+            objects.append(obj)
     driver_inventory = []
     for obj in scene.objects:
         for owner in (obj, obj.data, getattr(obj.data, "shape_keys", None)):
@@ -146,9 +188,20 @@ def main():
         print(label, "meshes", len(pose["meshes"]), "vertices", sum(m["vertices"] for m in pose["meshes"]), flush=True)
 
     def reset():
+        for _, key, value in shape_channels:
+            key.value = value
         for pb in rig.pose.bones:
             pb.matrix_basis = state[pb.name]
         bpy.context.view_layer.update()
+
+    def control_edits(names):
+        edits = []
+        for name in names:
+            t, q, scale = controls[name].matrix_basis.decompose()
+            values = list(t) + [math.degrees(v) for v in q.to_euler("XYZ")] + list(scale)
+            edits.extend({"id": bone_id(rig, name), "channel": ch, "value": float(value)}
+                         for ch, value in zip(("tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz"), values))
+        return edits
 
     capture("saved pose", [])
     for label, candidates, operation in preferred:
@@ -167,11 +220,38 @@ def main():
             from mathutils import Quaternion
             q = q @ Quaternion(Vector((1, 0, 0)), math.radians(20))
             pb.matrix_basis = Matrix.LocRotScale(t, q, s)
-        t, q, s = pb.matrix_basis.decompose()
-        xyz = list(t) + [math.degrees(v) for v in q.to_euler("XYZ")] + list(s)
-        channels = ("tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz")
-        capture(label + ": " + chosen, [{"id": bone_id(rig, chosen), "channel": ch, "value": float(val)}
-                                      for ch, val in zip(channels, xyz)])
+        capture(label + ": " + chosen, control_edits([chosen]))
+    if args.jaw_sweep:
+        jaw = next((n for n in ("jaw_master", "Jaw", "jaw") if n in controls), None)
+        if jaw is None:
+            parser.error("jaw sweep requested but no jaw control was found")
+        from mathutils import Quaternion
+        for angle in (-10, 10, 30, 40):
+            reset()
+            pb = controls[jaw]
+            t, q, scale = pb.matrix_basis.decompose()
+            pb.matrix_basis = Matrix.LocRotScale(t, q @ Quaternion(Vector((1, 0, 0)), math.radians(angle)), scale)
+            capture("jaw sweep %g degrees" % angle, control_edits([jaw]))
+        reset()
+        changed = [jaw]
+        t, q, scale = controls[jaw].matrix_basis.decompose()
+        controls[jaw].matrix_basis = Matrix.LocRotScale(t, q @ Quaternion(Vector((1, 0, 0)), math.radians(30)), scale)
+        head = next((n for n in ("head", "ROOT-Head") if n in controls), None)
+        if head:
+            changed.append(head)
+            t, q, scale = controls[head].matrix_basis.decompose()
+            controls[head].matrix_basis = Matrix.LocRotScale(t, q @ Quaternion(Vector((0, 0, 1)), math.radians(15)), scale)
+        root = next((n for n in ("root", "Root") if n in controls), None)
+        if root:
+            changed.append(root)
+            controls[root].location.x += extent * 0.08
+        capture("combined root head jaw", control_edits(changed))
+    for obj, key, _ in shape_channels:
+        for value in (0.0, 0.5, 1.0):
+            reset()
+            key.value = value
+            capture("shape %s/%s = %g" % (obj.name, key.name, value),
+                    [{"id": object_id(obj), "shape_key": key.name, "value": value}])
     reset()
     capture("reset", [])
     metadata["invalid_drivers"] = sum(not d["valid"] for d in driver_inventory)

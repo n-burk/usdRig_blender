@@ -21,6 +21,14 @@ PXR_NAMESPACE_USING_DIRECTIVE
 int main(int argc,char **argv) {
     try {
         CHECK(argc==4);
+        // The converter is a file format, never a runtime schema/mover plugin.
+        std::ifstream metadata(std::string(argv[1])+"/plugInfo.json"); CHECK(metadata);
+        const auto pluginData=JsParseStream(metadata).GetJsObject();
+        const auto info=pluginData.at("Plugins").GetJsArray().front().GetJsObject().at("Info").GetJsObject();
+        CHECK(info.size()==1); CHECK(info.count("Types"));
+        const auto types=info.at("Types").GetJsObject();
+        CHECK(types.size()==1); CHECK(types.count("UsdBlenderRigFileFormat"));
+        CHECK(!std::filesystem::exists(std::string(argv[1])+"/generatedSchema.usda"));
         PlugRegistry::GetInstance().RegisterPlugins(argv[1]);
         PlugRegistry::GetInstance().RegisterPlugins(argv[2]);
         auto format=SdfFileFormat::FindByExtension("blend"); CHECK(format);
@@ -31,6 +39,9 @@ int main(int argc,char **argv) {
         auto layer=SdfLayer::FindOrOpen(fixture); CHECK(layer);
         auto stage=UsdStage::Open(layer); CHECK(stage);
         CHECK(stage->GetDefaultPrim().GetTypeName()==TfToken("RigExecRoot"));
+        bool baked=false;
+        CHECK(stage->GetDefaultPrim().GetAttribute(TfToken("rigExec:baked")).Get(&baked));
+        CHECK(baked);
         CHECK(stage->GetTimeCodesPerSecond()==30);
         CHECK(layer->GetCustomLayerData()["blenderRig:complete"].Get<bool>());
         int joints=0,skins=0,constraints=0,meshes=0;
@@ -259,6 +270,9 @@ int main(int argc,char **argv) {
         // Anonymous USDA serialization can be reopened without the source reader.
         auto usd=SdfLayer::CreateAnonymous("native.usda"); CHECK(usd->ImportFromString(original));
         CHECK(UsdStage::Open(usd)->GetDefaultPrim().GetTypeName()==TfToken("RigExecRoot"));
+        baked=false;
+        CHECK(UsdStage::Open(usd)->GetDefaultPrim().GetAttribute(TfToken("rigExec:baked")).Get(&baked));
+        CHECK(baked);
         auto textured=json.GetJsObject();
         textured["source"]=JsValue(std::filesystem::absolute(fixture).string());
         auto mats=textured["materials"].GetJsArray(); auto mat=mats[0].GetJsObject();

@@ -9,6 +9,18 @@ import numpy as np
 from pxr import Usd, UsdGeom
 
 
+def resolve_edit_attribute(edit, controls, meshes):
+    """Resolve source edits through the native control/shape channel contract."""
+    if "shape_key" in edit:
+        mesh = meshes[edit["id"]]
+        matches = [a for a in mesh.GetAttributes()
+                   if a.GetCustomDataByKey("blender:shapeKey") == edit["shape_key"]]
+        if len(matches) != 1:
+            raise ValueError("missing or ambiguous native shape channel: " + edit["shape_key"])
+        return matches[0]
+    return controls[edit["id"]].GetAttribute("avars:" + edit["channel"])
+
+
 def compare_pose(sample, reference, reference_path, providers, meshes, baseline,
                  sample_index, read_points, read_frame, valid=True,
                  diagnostics=(), measurement_prefix=None):
@@ -159,16 +171,16 @@ def main():
     if args.incremental:
         for sample in reference["poses"]:
             for edit in sample["edits"]:
-                key = (edit["id"], edit["channel"])
-                initial_channels[key] = controls[edit["id"]].GetAttribute("avars:" + edit["channel"]).Get()
+                attribute = resolve_edit_attribute(edit, controls, meshes)
+                initial_channels[attribute.GetPath()] = (attribute, attribute.Get())
     for sample_index, sample in enumerate(reference["poses"]):
         if args.incremental:
-            for (ident, channel), value in initial_channels.items():
-                controls[ident].GetAttribute("avars:" + channel).Set(value)
+            for attribute, value in initial_channels.values():
+                attribute.Set(value)
         else:
             stage.GetSessionLayer().Clear()
         for edit in sample["edits"]:
-            controls[edit["id"]].GetAttribute("avars:" + edit["channel"]).Set(edit["value"])
+            resolve_edit_attribute(edit, controls, meshes).Set(edit["value"])
         pose = rig.evaluate(-1)
         def read_points(prim):
             moved = pose.moved_property(str(prim.GetPath()) + ".points")

@@ -3,15 +3,20 @@
 #include "rigExecRigging/schemaAuthoring.h"
 #include "rigExec/rigEvaluator.h"
 #include "pxr/base/js/json.h"
+#include "pxr/base/plug/registry.h"
+#include "pxr/base/plug/plugin.h"
+#include "pxr/usd/sdf/copyUtils.h"
 #include "pxr/base/gf/vec2f.h"
 #include "pxr/base/gf/vec4f.h"
 #include "pxr/base/gf/rotation.h"
 #include "pxr/usd/ar/resolvedPath.h"
 #include "pxr/usd/ar/resolver.h"
 #include "pxr/usd/usdGeom/mesh.h"
+#include "pxr/usd/usdGeom/points.h"
 #include "pxr/usd/usdGeom/metrics.h"
 #include "pxr/usd/usdGeom/primvarsAPI.h"
 #include "pxr/usd/usdGeom/subset.h"
+#include "pxr/usd/usdSkel/blendShape.h"
 #include "pxr/usd/usdShade/material.h"
 #include "pxr/usd/usdShade/materialBindingAPI.h"
 #include "pxr/usd/usdShade/shader.h"
@@ -267,7 +272,7 @@ public:
             if(!std::set<std::string>{"FULL","NONE","AVERAGE","ALIGNED","FIX_SHEAR","NONE_LEGACY"}.count(mode))
                 throw std::runtime_error("unknown bone inheritance mode: "+mode);
             auto &object=Find(Str(bone.data,"armature"));
-            auto mechanism=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("bone_"+bone.name)),TfToken("RigExecBlenderBoneFrame"));
+            auto mechanism=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("bone_"+bone.name)),TfToken("RigExecBoneFrame"));
             mechanism.SetAttribute(TfToken("inputs:local"),VtValue(bone.rest));
             mechanism.SetAttribute(TfToken("inputs:inheritScale"),VtValue(TfToken(mode)));
             mechanism.SetAttribute(TfToken("inputs:inheritRotation"),VtValue(Flag(bone.data,"inherit_rotation",true)));
@@ -295,7 +300,7 @@ public:
             frame.SetAttribute(TfToken("rest:space"),VtValue(GfMatrix4d(1)));
             frame.SetAttribute(TfToken("default:space"),VtValue(GfMatrix4d(1)));
             frame.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
-            auto neutral=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("controlFrame_"+bone.name)),TfToken("RigExecBlenderBoneFrame"));
+            auto neutral=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("controlFrame_"+bone.name)),TfToken("RigExecBoneFrame"));
             neutral.SetAttribute(TfToken("inputs:local"),VtValue(bone.rest));
             neutral.SetAttribute(TfToken("inputs:inheritScale"),VtValue(TfToken(mode)));
             neutral.SetAttribute(TfToken("inputs:inheritRotation"),VtValue(Flag(bone.data,"inherit_rotation",true)));
@@ -351,7 +356,7 @@ public:
                 translation.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
                 AbsolutePoseParent(translation.GetPrim());
                 const auto translationExprPath=neutral.GetPath().AppendChild(TfToken("Translation"));
-                auto translationExpr=rigExec::RigExecSchemaPrim::Define(stage,translationExprPath,TfToken("RigExecBlenderBoneFrame"));
+                auto translationExpr=rigExec::RigExecSchemaPrim::Define(stage,translationExprPath,TfToken("RigExecBoneFrame"));
                 for(const auto &attr:neutral.GetPrim().GetAuthoredAttributes()) {
                     VtValue value;
                     if(attr.Get(&value)) translationExpr.GetPrim().CreateAttribute(attr.GetName(),attr.GetTypeName()).Set(value);
@@ -428,7 +433,7 @@ public:
             }
             if(!ownShape) Warn("guide follows a different source and is not the native editable control: "+n.id);
             auto frame=[&](rigExec::RigExecSchemaPrim &target,Node &sourceNode,const std::string &suffix) {
-                auto expression=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("guide_"+n.name+suffix)),TfToken("RigExecBlenderCopyTransforms"));
+                auto expression=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("guide_"+n.name+suffix)),TfToken("RigExecCopyFrame"));
                 expression.SetRelationship(TfToken("rigExec:source"),{sourceNode.path});
                 expression.SetRelationship(TfToken("rigExec:poseInputs"),{sourceNode.path});
                 AbsolutePoseParent(target.GetPrim());
@@ -524,7 +529,7 @@ public:
         solver.SetAttribute(TfToken("rigExec:restLength"),VtValue(TfToken("curve")));
         solver.GetPrim().SetCustomDataByKey(TfToken("blender:source"),VtValue(JsWriteToString(c)));
         for(int i=0;i<count;++i) {
-            auto mapped=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken(name+"_bone_"+std::to_string(i))),TfToken("RigExecBlenderMappedFrame"));
+            auto mapped=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken(name+"_bone_"+std::to_string(i))),TfToken("RigExecMappedFrame"));
             mapped.SetAttribute(TfToken("inputs:targetRest"),VtValue(chain[i]->world));
             mapped.SetAttribute(TfToken("inputs:sourceRest"),VtValue(virtualRests[i]));
             mapped.SetRelationship(TfToken("rigExec:source"),{joints[i]});
@@ -597,15 +602,19 @@ public:
         for(const auto &owner:owners) visit(owner);
     }
     bool NativeConstraintStack(Node &owner,const std::vector<size_t> &stack,const JsArray &items,bool validateOnly=false) {
-        if(owner.kind!="joint" || !Has(owner.data,"armature") || stack.empty()) return false;
+        if(stack.empty()) return false;
+        const bool boneOwner=owner.kind=="joint" && Has(owner.data,"armature");
+        const bool objectOwner=owner.kind=="control" && Has(owner.data,"object_type");
+        if(!boneOwner && !objectOwner)return false;
         for(size_t index:stack) {
             const auto &c=items[index];auto type=Str(c,"type");
-            if(!std::set<std::string>{"COPY_LOCATION","COPY_ROTATION","COPY_SCALE","COPY_TRANSFORMS","ARMATURE","STRETCH_TO","DAMPED_TRACK","LIMIT_ROTATION"}.count(type)) return false;
+            if(!boneOwner && type!="ARMATURE")return false;
+            if(!std::set<std::string>{"COPY_LOCATION","COPY_ROTATION","COPY_SCALE","COPY_TRANSFORMS","ARMATURE","STRETCH_TO","DAMPED_TRACK","LIMIT_ROTATION","TRANSFORM"}.count(type)) return false;
             bool copy=type.find("COPY_")==0;
             for(const char *space:{"owner_space","target_space"}) {
                 auto value=Str(c,space);
-                if(value!="WORLD" && !(copy && (value=="POSE" || value=="LOCAL" || value=="CUSTOM" ||
-                    (std::string(space)=="target_space" && value=="LOCAL_OWNER_ORIENT"))))return false;
+                if(value!="WORLD" && !((copy || type=="TRANSFORM") && (value=="POSE" || value=="LOCAL" || value=="CUSTOM" ||
+                    (copy && std::string(space)=="target_space" && value=="LOCAL_OWNER_ORIENT"))))return false;
                 if(value=="CUSTOM" && (!Has(c,"custom_space") || Flag(c,"custom_space_unsupported",false)))return false;
             }
             if(type=="LIMIT_ROTATION") {
@@ -627,6 +636,24 @@ public:
             }
             if(Str(c,"source").empty())return false;
             auto &src=Find(Str(c,"source"));
+            if(type=="TRANSFORM") {
+                if(!Has(c,"map_from") || !Has(c,"map_to") || Str(c,"map_to")!="LOCATION" ||
+                    !std::set<std::string>{"LOCATION","ROTATION","SCALE"}.count(Str(c,"map_from")) ||
+                    !Has(c,"mix_mode") || !std::set<std::string>{"ADD","REPLACE"}.count(Str(c,"mix_mode")))return false;
+                if(Str(c,"map_from")=="ROTATION") {
+                    if(!Has(c,"from_rotation_mode") || (Str(c,"from_rotation_mode")!="XYZ" &&
+                        (Str(c,"from_rotation_mode")!="AUTO" || (Has(owner.data,"rotation_mode") &&
+                         !std::set<std::string>{"XYZ","QUATERNION","AXIS_ANGLE"}.count(Str(owner.data,"rotation_mode"))))))return false;
+                }
+                const std::string suffix=Str(c,"map_from")=="ROTATION"?"_rot":Str(c,"map_from")=="SCALE"?"_scale":"";
+                for(char axis:std::string("xyz")) {
+                    const std::string a(1,axis);
+                    if(!Has(c,"map_to_"+a+"_from") || !std::set<std::string>{"X","Y","Z"}.count(Str(c,"map_to_"+a+"_from")))return false;
+                    for(const auto &field:{"from_min_"+a+suffix,"from_max_"+a+suffix,"to_min_"+a,"to_max_"+a})
+                        if(!Has(c,field))return false;
+                    if(Number(Field(c,"from_min_"+a+suffix))>Number(Field(c,"from_max_"+a+suffix)))return false;
+                }
+            }
             if(Str(c,"target_space")!="WORLD" && Str(c,"target_space")!="CUSTOM" && (src.kind!="joint" || !Has(src.data,"armature")))return false;
             if(type=="COPY_ROTATION") {
                 int count=Flag(c,"use_x",true)+Flag(c,"use_y",true)+Flag(c,"use_z",true);
@@ -650,17 +677,34 @@ public:
         if(validateOnly)return true;
         auto posed=stage->GetPrimAtPath(owner.path).GetAttribute(TfToken("posed:space"));
         SdfPathVector inputs;posed.GetConnections(&inputs);
-        if(inputs.size()!=1)throw std::runtime_error("native constraint stack requires base bone frame");
+        if(objectOwner && inputs.empty()) {
+            // Object Armature constraints consume the owner's complete live
+            // world frame. The generic parent expression supplies that frame
+            // without applying any source map before the constraint stack.
+            auto base=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("objectBase_"+owner.name)),TfToken("RigExecArmatureParent"));
+            base.SetAttribute(TfToken("inputs:local"),VtValue(owner.rest));
+            if(!owner.parent.empty()) {
+                const auto parent=Find(owner.parent).path;
+                base.SetRelationship(TfToken("rigExec:parent"),{parent});
+                base.SetRelationship(TfToken("rigExec:poseInputs"),{parent});
+            }
+            for(const auto *channel:{"tx","ty","tz","rx","ry","rz","sx","sy","sz"})
+                base.GetPrim().GetAttribute(TfToken(std::string("inputs:")+channel)).SetConnections({owner.path.AppendProperty(TfToken(std::string("avars:")+channel))});
+            inputs.push_back(base.GetPath().AppendProperty(TfToken("outputs:matrix")));
+            AbsolutePoseParent(stage->GetPrimAtPath(owner.path));
+        }
+        if(inputs.size()!=1)throw std::runtime_error("native constraint stack requires one incoming frame");
         auto base=inputs[0],previous=base;
         // The incoming expression reads the owner's live parent even when
         // the constraint itself only names target frames. Declare that
         // closure, and earlier stack inputs, for usdRig's pose refresh.
-        SdfPathVector stackDependencies={Find(Str(owner.data,"armature")).path};
-        if(Find(owner.parent).kind=="joint")stackDependencies.push_back(Find(owner.parent).path);
+        SdfPathVector stackDependencies;
+        if(boneOwner)stackDependencies.push_back(Find(Str(owner.data,"armature")).path);
+        if(!owner.parent.empty() && (objectOwner || Find(owner.parent).kind=="joint"))stackDependencies.push_back(Find(owner.parent).path);
         for(size_t index:stack) {
             const auto &c=items[index];auto type=Str(c,"type");
             Node *src=Str(c,"source").empty()?nullptr:&Find(Str(c,"source"));
-            auto op=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("stack_"+std::to_string(index))),TfToken("RigExecBlenderConstraintFrame"));
+            auto op=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("stack_"+std::to_string(index))),TfToken("RigExecConstraintFrame"));
             op.GetPrim().GetAttribute(TfToken("inputs:incoming")).SetConnections({previous});
             op.SetAttribute(TfToken("inputs:operation"),VtValue(TfToken(type)));
             op.SetAttribute(TfToken("inputs:influence"),VtValue(Number(Field(c,"influence"))));
@@ -723,10 +767,14 @@ public:
                 op.SetAttribute(TfToken("inputs:targetIndices"),VtValue(targetIndices));
                 op.SetAttribute(TfToken("inputs:objectIndices"),VtValue(objectIndices));
                 op.SetAttribute(TfToken("inputs:dualQuaternion"),VtValue(Flag(c,"use_deform_preserve_volume",false)));
-                op.SetAttribute(TfToken("inputs:currentPivot"),VtValue(Flag(c,"use_current_location",false)));
-                auto &object=Find(Str(owner.data,"armature"));
-                op.SetAttribute(TfToken("inputs:pivot"),VtValue((owner.world*object.world.GetInverse()).ExtractTranslation()));
-                op.SetRelationship(TfToken("rigExec:ownerObject"),{object.path});add(dependencies,object.path);
+                // Objects always bind at the incoming origin; the optional
+                // rest-head pivot in the source contract applies only to bones.
+                op.SetAttribute(TfToken("inputs:currentPivot"),VtValue(objectOwner || Flag(c,"use_current_location",false)));
+                if(boneOwner) {
+                    auto &object=Find(Str(owner.data,"armature"));
+                    op.SetAttribute(TfToken("inputs:pivot"),VtValue((owner.world*object.world.GetInverse()).ExtractTranslation()));
+                    op.SetRelationship(TfToken("rigExec:ownerObject"),{object.path});add(dependencies,object.path);
+                }
                 op.SetRelationship(TfToken("rigExec:targets"),targets);op.SetRelationship(TfToken("rigExec:targetObjects"),objects);
             }
             if(type=="COPY_LOCATION" || type=="COPY_SCALE" || type=="COPY_ROTATION") {
@@ -738,6 +786,21 @@ public:
             if(type=="COPY_TRANSFORMS") {
                 op.SetAttribute(TfToken("inputs:rotationMix"),VtValue(TfToken(Has(c,"mix_mode")?Str(c,"mix_mode"):"REPLACE")));
                 op.SetAttribute(TfToken("inputs:removeTargetShear"),VtValue(Flag(c,"remove_target_shear",false)));
+            }
+            if(type=="TRANSFORM") {
+                op.SetAttribute(TfToken("inputs:operation"),VtValue(TfToken("TRANSFORM_LOCATION")));
+                op.SetAttribute(TfToken("inputs:mapFrom"),VtValue(TfToken(Str(c,"map_from"))));
+                const std::string suffix=Str(c,"map_from")=="ROTATION"?"_rot":Str(c,"map_from")=="SCALE"?"_scale":"";
+                GfVec3i axes;
+                for(int i=0;i<3;++i)axes[i]=int(std::string("XYZ").find(Str(c,"map_to_"+std::string(1,"xyz"[i])+"_from")));
+                op.SetAttribute(TfToken("inputs:mapAxes"),VtValue(axes));
+                for(const auto &entry:std::vector<std::pair<std::string,std::string>>{{"from_min","mapFromMin"},{"from_max","mapFromMax"},{"to_min","mapToMin"},{"to_max","mapToMax"}}) {
+                    GfVec3d values;
+                    for(int i=0;i<3;++i)values[i]=Number(Field(c,entry.first+"_"+"xyz"[i]+(entry.first.find("from_")==0?suffix:"")));
+                    op.SetAttribute(TfToken("inputs:"+entry.second),VtValue(values));
+                }
+                op.SetAttribute(TfToken("inputs:mapExtrapolate"),VtValue(Flag(c,"use_motion_extrapolate",false)));
+                op.SetAttribute(TfToken("inputs:mapMix"),VtValue(TfToken(Str(c,"mix_mode"))));
             }
             if(type=="COPY_ROTATION")op.SetAttribute(TfToken("inputs:rotationMix"),VtValue(TfToken(Has(c,"mix_mode")?Str(c,"mix_mode"):"REPLACE")));
             if(type=="COPY_SCALE") {
@@ -760,7 +823,7 @@ public:
             previous=op.GetPath().AppendProperty(TfToken("outputs:matrix"));
         }
         if(Flag(owner.data,"connected",false)) {
-            auto op=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("origin_"+owner.name)),TfToken("RigExecBlenderConstraintFrame"));
+            auto op=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("origin_"+owner.name)),TfToken("RigExecConstraintFrame"));
             op.SetAttribute(TfToken("inputs:operation"),VtValue(TfToken("PRESERVE_ORIGIN")));
             op.GetPrim().GetAttribute(TfToken("inputs:incoming")).SetConnections({previous});
             op.GetPrim().GetAttribute(TfToken("inputs:origin")).SetConnections({base});
@@ -796,7 +859,7 @@ public:
                Num(src.data,"bbone_segments",1)!=1) {
                 Warn("armature constraint requires first position, one simple target, full influence and linear/no-envelope mode: "+label); return;
             }
-            auto mechanism=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("armature_"+std::to_string(index))),TfToken("RigExecBlenderArmatureParent"));
+            auto mechanism=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("armature_"+std::to_string(index))),TfToken("RigExecArmatureParent"));
             mechanism.SetAttribute(TfToken("inputs:local"),VtValue(owner.rest));
             mechanism.SetAttribute(TfToken("inputs:preserveLocation"),VtValue(Flag(owner.data,"connected",false)));
             auto posed=stage->GetPrimAtPath(owner.path).GetAttribute(TfToken("posed:space"));
@@ -828,7 +891,7 @@ public:
         }
         const std::string name="constraint_"+std::to_string(index);
         if(type=="COPY_TRANSFORMS" && first && Number(Field(c,"influence"))==1 && !Flag(c,"remove_target_shear",false)) {
-            auto mechanism=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("copy_"+std::to_string(index))),TfToken("RigExecBlenderCopyTransforms"));
+            auto mechanism=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken("copy_"+std::to_string(index))),TfToken("RigExecCopyFrame"));
             mechanism.SetRelationship(TfToken("rigExec:source"),{src.path});
             mechanism.SetRelationship(TfToken("rigExec:poseInputs"),{src.path});
             bool connected=Flag(owner.data,"connected",false);
@@ -1000,7 +1063,7 @@ public:
     SdfPath SkinProvider(Node &mesh,Node *bone,const std::string &name,bool fromBind) {
         auto provider=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken(name)),TfToken("RigExecControl"));
         provider.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
-        auto expression=rigExec::RigExecSchemaPrim::Define(stage,provider.GetPath().AppendChild(TfToken("Compute")),TfToken("RigExecBlenderSkinInfluence"));
+        auto expression=rigExec::RigExecSchemaPrim::Define(stage,provider.GetPath().AppendChild(TfToken("Compute")),TfToken("RigExecSkinInfluence"));
         expression.SetAttribute(TfToken("inputs:inverseMesh"),VtValue(mesh.world.GetInverse()));
         expression.SetAttribute(TfToken("inputs:fromBind"),VtValue(fromBind));
         expression.SetAttribute(TfToken("inputs:followOnly"),VtValue(!bone));
@@ -1016,6 +1079,190 @@ public:
         expression.SetRelationship(TfToken("rigExec:poseInputs"),dependencies);
         provider.GetPrim().GetAttribute(TfToken("posed:space")).SetConnections({expression.GetPath().AppendProperty(TfToken("outputs:matrix"))});
         return provider.GetPath();
+    }
+    void SurfaceBinding(Node &node,const JsValue &binding,const SdfPath &target,size_t index) {
+        auto &surface=Find(Str(binding,"target"));
+        const auto name="surface_"+node.name+"_"+std::to_string(index);
+        Chain(name,target);
+        auto op=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Movers").AppendChild(TfToken(name)).AppendChild(TfToken("deform")),TfToken("RigExecSurfaceBindingMover"));
+        op.ApplyAPI(TfToken("RigExecMoverAPI"));
+        op.SetRelationship(TfToken("rigExec:moves"),{target});
+        op.SetRelationship(TfToken("rigExec:surface"),{SdfPath("/Rig/Geometry").AppendChild(TfToken(surface.name))});
+        op.SetReadPhase(TfToken("rigExec:surface"),"final");
+        op.SetRelationship(TfToken("rigExec:frames"),{
+            SkinProvider(surface,nullptr,name+"_surface",true),SkinProvider(node,nullptr,name+"_target",true)});
+        op.SetReadPhase(TfToken("rigExec:frames"),"final");
+        op.SetAttribute(TfToken("rigExec:surfaceRestMatrix"),VtValue(surface.world));
+        op.SetAttribute(TfToken("rigExec:targetRestMatrix"),VtValue(node.world));
+        op.SetAttribute(TfToken("rigExec:surfaceToBinding"),VtValue(Matrix(Field(binding,"bind_matrix"))));
+        const std::pair<const char *,const char *> ints[]={
+            {"vertices","vertices"},{"vertex_offsets","vertexOffsets"},
+            {"polygon_offsets","polygonOffsets"},{"indices","pointIndices"}};
+        for(const auto &entry:ints) {
+            VtIntArray values;for(const auto &v:Array(Field(binding,entry.first)))values.push_back(Integer(v));
+            op.SetAttribute(TfToken(std::string("rigExec:")+entry.second),VtValue(values));
+        }
+        const std::pair<const char *,const char *> floats[]={
+            {"weights","barycentricWeights"},{"influences","bindingWeights"},{"mask","mask"}};
+        for(const auto &entry:floats) {
+            VtFloatArray values;for(const auto &v:Array(Field(binding,entry.first)))values.push_back(Float(v));
+            op.SetAttribute(TfToken(std::string("rigExec:")+entry.second),VtValue(values));
+        }
+        VtVec3fArray offsets;for(const auto &v:Array(Field(binding,"offsets")))offsets.push_back(Point(v));
+        op.SetAttribute(TfToken("rigExec:offsets"),VtValue(offsets));
+        op.SetAttribute(TfToken("rigExec:strength"),VtValue(Float(Field(binding,"strength"))));
+    }
+    void Lattices() {
+        if(!Has(scene,"lattices"))return;
+        for(const auto &data:Array(Field(scene,"lattices"))) {
+            auto &node=Find(Str(data,"id"));
+            auto cage=UsdGeomPoints::Define(stage,SdfPath("/Rig/Geometry").AppendChild(TfToken(node.name)));
+            cage.GetPrim().SetCustomDataByKey(TfToken("blender:id"),VtValue(node.id));
+            cage.CreateVisibilityAttr().Set(UsdGeomTokens->invisible);
+            VtVec3fArray points;
+            for(const auto &p:Array(Field(data,"points"))) {
+                const auto transformed=node.world.Transform(GfVec3d(Point(p)));
+                for(int axis=0;axis<3;++axis)if(!std::isfinite(transformed[axis]) || std::abs(transformed[axis])>std::numeric_limits<float>::max())
+                    throw std::runtime_error("transformed lattice point overflow");
+                points.push_back(GfVec3f(transformed));
+            }
+            const auto &dimensions=Array(Field(data,"divisions"));
+            size_t count=1;
+            if(dimensions.size()!=3)throw std::runtime_error("lattice dimensions require three axes");
+            for(const auto &d:dimensions) {
+                const int n=Integer(d);if(n<1 || size_t(n)>MaxElements/count)throw std::runtime_error("invalid lattice dimensions");
+                count*=size_t(n);
+            }
+            if(points.size()!=count)
+                throw std::runtime_error("lattice grid size mismatch");
+            cage.CreatePointsAttr().Set(points);
+            const auto target=cage.GetPointsAttr().GetPath();
+            const auto follow=SkinProvider(node,nullptr,"latticeFollow_"+node.name,true);
+            Chain("latticeFollow_"+node.name,target).AddMatrixMover("follow",follow,{},{},TfToken("final"));
+            size_t index=0;
+            for(const auto &hook:Array(Field(data,"hooks"))) {
+                auto &source=Find(Str(hook,"source"));
+                const auto name="latticeHook_"+node.name+"_"+std::to_string(index++);
+                auto provider=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(TfToken(name)),TfToken("RigExecControl"));
+                provider.SetAttribute(TfToken("guide:displayOpacity"),VtValue(0.0f));
+                auto expression=rigExec::RigExecSchemaPrim::Define(stage,provider.GetPath().AppendChild(TfToken("Compute")),TfToken("RigExecSkinInfluence"));
+                expression.SetAttribute(TfToken("inputs:fromBind"),VtValue(false));
+                expression.SetAttribute(TfToken("inputs:followOnly"),VtValue(false));
+                expression.SetAttribute(TfToken("inputs:inverseBind"),VtValue(Matrix(Field(hook,"inverse"))));
+                expression.SetRelationship(TfToken("rigExec:source"),{source.path});
+                expression.SetRelationship(TfToken("rigExec:sourceObject"),{node.path});
+                expression.SetRelationship(TfToken("rigExec:poseInputs"),{source.path,node.path});
+                provider.GetPrim().GetAttribute(TfToken("posed:space")).SetConnections({expression.GetPath().AppendProperty(TfToken("outputs:matrix"))});
+                const float strength=Float(Field(hook,"strength"));
+                std::vector<float> weights;for(const auto &w:Array(Field(hook,"mask")))weights.push_back(Float(w)*strength);
+                if(weights.size()!=points.size())throw std::runtime_error("lattice hook mask size mismatch");
+                const auto weight=rig.AddStaticWeight(name+"_mask",target,weights);
+                auto mover=Chain(name,target).AddMatrixMover("hook",provider.GetPath(),weight.GetPath(),{},TfToken("final"));
+            }
+        }
+    }
+    void Deformer(Node &node,const JsValue &data,const SdfPath &target,size_t index) {
+        const auto kind=Str(data,"type"),name=kind+"_"+node.name+"_"+std::to_string(index);
+        if(kind!="deltaMush" && kind!="shrinkwrap" && kind!="lattice")throw std::runtime_error("unknown geometry deformer type: "+kind);
+        Chain(name,target);
+        const auto type=kind=="deltaMush"?"RigExecDeltaMushMover":kind=="shrinkwrap"?"RigExecSurfaceMover":"RigExecLatticeMover";
+        auto op=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Movers").AppendChild(TfToken(name)).AppendChild(TfToken("deform")),TfToken(type));
+        op.ApplyAPI(TfToken("RigExecMoverAPI"));op.SetRelationship(TfToken("rigExec:moves"),{target});
+        VtFloatArray mask;for(const auto &w:Array(Field(data,"mask")))mask.push_back(Float(w));
+        if(kind=="deltaMush") {
+            VtVec3fArray rest;for(const auto &p:Array(Field(data,"rest_points")))rest.push_back(Point(p));
+            op.SetAttribute(TfToken("inputs:restPoints"),VtValue(rest));
+            op.SetAttribute(TfToken("inputs:iterations"),VtValue(Integer(Field(data,"iterations"))));
+            op.SetAttribute(TfToken("inputs:step"),VtValue(Float(Field(data,"factor"))));
+            op.SetAttribute(TfToken("inputs:displacement"),VtValue(Float(Field(data,"detail"))));
+            op.SetAttribute(TfToken("inputs:pinBorders"),VtValue(Bool(Field(data,"pin_boundary"))));
+            op.SetAttribute(TfToken("inputs:smoothing"),VtValue(TfToken(Str(data,"smoothing"))));
+            op.SetAttribute(TfToken("inputs:frameTransport"),VtValue(TfToken("corner")));
+            op.SetAttribute(TfToken("inputs:onlySmooth"),VtValue(Bool(Field(data,"only_smooth"))));
+            op.SetAttribute(TfToken("inputs:smoothWeights"),VtValue(mask));
+            VtIntArray edges;for(const auto &e:Array(Field(data,"edges")))edges.push_back(Integer(e));
+            op.SetAttribute(TfToken("inputs:edges"),VtValue(edges));
+            op.SetAttribute(TfToken("inputs:computationToTarget"),VtValue(node.world));
+            op.SetRelationship(TfToken("rigExec:frame"),{SkinProvider(node,nullptr,name+"_owner",true)});
+            op.SetReadPhase(TfToken("rigExec:frame"),"final");
+            return;
+        }
+        auto &dependency=Find(Str(data,kind=="shrinkwrap"?"target":"cage"));
+        op.SetAttribute(TfToken("rigExec:pointSpace"),VtValue(TfToken("common")));
+        op.SetAttribute(TfToken("rigExec:targetMatrix"),VtValue(node.world));
+        op.SetAttribute(TfToken("rigExec:mask"),VtValue(mask));
+        op.SetRelationship(TfToken("rigExec:frames"),{SkinProvider(dependency,nullptr,name+"_dependency",true),SkinProvider(node,nullptr,name+"_owner",true)});
+        op.SetReadPhase(TfToken("rigExec:frames"),"final");
+        const auto dependencyPath=SdfPath("/Rig/Geometry").AppendChild(TfToken(dependency.name));
+        if(kind=="shrinkwrap") {
+            op.SetRelationship(TfToken("rigExec:surface"),{dependencyPath});op.SetReadPhase(TfToken("rigExec:surface"),"final");
+            op.SetAttribute(TfToken("rigExec:surfaceMatrix"),VtValue(dependency.world));
+            op.SetAttribute(TfToken("rigExec:snapMode"),VtValue(TfToken(Str(data,"mode"))));
+            op.SetAttribute(TfToken("rigExec:offset"),VtValue(Float(Field(data,"offset"))));
+            VtIntArray triangles;for(const auto &v:Array(Field(data,"triangles")))triangles.push_back(Integer(v));
+            op.SetAttribute(TfToken("rigExec:triangles"),VtValue(triangles));
+        } else {
+            const JsValue *lattice=nullptr;
+            for(const auto &candidate:Array(Field(scene,"lattices")))if(Str(candidate,"id")==dependency.id){lattice=&candidate;break;}
+            if(!lattice)throw std::runtime_error("missing lattice data");
+            const auto &dims=Array(Field(*lattice,"divisions")),&interpolation=Array(Field(*lattice,"interpolation"));
+            if(dims.size()!=3||interpolation.size()!=3)throw std::runtime_error("lattice dimensions/interpolation mismatch");
+            const std::map<std::string,std::string> modes{{"KEY_LINEAR","linear"},{"KEY_BSPLINE","bspline"},{"KEY_CARDINAL","cardinal"},{"KEY_CATMULL_ROM","catmullRom"}};
+            op.SetRelationship(TfToken("rigExec:cage"),{dependencyPath});op.SetReadPhase(TfToken("rigExec:cage"),"final");
+            op.SetAttribute(TfToken("rigExec:evaluation"),VtValue(TfToken("regularGrid")));
+            op.SetAttribute(TfToken("rigExec:divisions"),VtValue(GfVec3i(Integer(dims[0]),Integer(dims[1]),Integer(dims[2]))));
+            op.SetAttribute(TfToken("rigExec:origin"),VtValue(Point(Field(*lattice,"origin"))));
+            op.SetAttribute(TfToken("rigExec:spacing"),VtValue(Point(Field(*lattice,"spacing"))));
+            op.SetAttribute(TfToken("rigExec:cageMatrix"),VtValue(dependency.world));
+            op.SetAttribute(TfToken("rigExec:strength"),VtValue(Float(Field(data,"strength"))));
+            for(int axis=0;axis<3;++axis)op.SetAttribute(TfToken(std::string("rigExec:interpolation")+"UVW"[axis]),VtValue(TfToken(modes.at(String(interpolation[axis])))));
+        }
+    }
+    void ShapeKeys(Node &node,const JsValue &data,const UsdGeomMesh &mesh,size_t pointCount) {
+        if(!Has(data,"shape_keys") || Array(Field(data,"shape_keys")).empty())return;
+        auto op=Chain("shape_"+node.name,mesh.GetPath().AppendProperty(TfToken("points"))).AddBlendShapeMover("deform");
+        std::set<std::string> names;
+        for(const auto &key:Array(Field(data,"shape_keys"))) {
+            const std::string name=Str(key,"name"),encoded=PropertyName(name);
+            if(!names.insert(name).second)throw std::runtime_error("duplicate shape key name");
+            const float minimum=Float(Field(key,"minimum")),maximum=Float(Field(key,"maximum")),value=Float(Field(key,"value"));
+            if(minimum>maximum)
+                throw std::runtime_error("invalid shape key range/value");
+            const auto &deltas=Array(Field(key,"deltas"));
+            if(deltas.size()!=pointCount)throw std::runtime_error("shape key point count mismatch");
+            auto weight=mesh.GetPrim().CreateAttribute(TfToken("blender:shapeKey:"+encoded),SdfValueTypeNames->Float);
+            weight.Set(value);weight.SetDisplayName(name);
+            weight.SetCustomDataByKey(TfToken("blender:shapeKey"),VtValue(name));
+            weight.SetCustomDataByKey(TfToken("blender:minimum"),VtValue(minimum));
+            weight.SetCustomDataByKey(TfToken("blender:maximum"),VtValue(maximum));
+            weight.SetCustomDataByKey(TfToken("blender:mute"),VtValue(Flag(key,"mute",false)));
+            for(int sign:{1,-1}) {
+                const float activation=sign>0?std::max({1.f,maximum,value}):std::max({0.f,-minimum,-value});
+                if(activation<=0)continue;
+                const std::string branch=encoded+(sign>0?"_positive":"_negative");
+                auto input=op.AddBlendInput(branch);
+                SdfPath source=weight.GetPath();
+                if(sign<0) {
+                    auto negative=mesh.GetPrim().CreateAttribute(TfToken("blender:shapeKeyNegative:"+encoded),SdfValueTypeNames->Float);
+                    negative.Set(-1.f);
+                    auto invert=Chain("shape_weight_"+node.name+"_"+encoded,negative.GetPath()).AddFloatMathMover("invert",TfToken("multiply"),value);
+                    invert.GetPrim().GetAttribute(TfToken("inputs:value")).SetConnections({source});source=negative.GetPath();
+                }
+                input.ConnectWeight(source);
+                VtVec3fArray offsets;VtIntArray indices;
+                for(size_t i=0;i<deltas.size();++i) {
+                    const auto delta=node.world.TransformDir(GfVec3d(Point(deltas[i]))) * (sign*activation);
+                    for(int axis=0;axis<3;++axis)if(!std::isfinite(delta[axis]) || std::abs(delta[axis])>std::numeric_limits<float>::max())
+                        throw std::runtime_error("transformed shape key overflow");
+                    if(delta!=GfVec3d(0)) {indices.push_back(static_cast<int>(i));offsets.emplace_back(delta);}
+                }
+                // Empty sparse indices mean a dense sample in the native contract.
+                if(indices.empty())offsets.assign(pointCount,GfVec3f(0));
+                auto shape=UsdSkelBlendShape::Define(stage,op.GetPath().AppendChild(TfToken(branch+"_shape")));
+                shape.CreateOffsetsAttr().Set(offsets);shape.CreatePointIndicesAttr().Set(indices);
+                input.AddSample("sample",activation).SetBlendShape(shape.GetPath());
+            }
+        }
     }
     void Geometry() {
         std::set<std::string> ids;
@@ -1092,15 +1339,31 @@ public:
                 }
             }
             JsArray skins;
-            if(Has(data,"skin_stack")) skins=Array(Field(data,"skin_stack"));
+            if(Has(data,"deformers")) skins=Array(Field(data,"deformers"));
+            else if(Has(data,"skin_stack")) skins=Array(Field(data,"skin_stack"));
             else if(!Field(data,"skin").IsNull()) skins.push_back(Field(data,"skin"));
-            if(skins.empty()) {
+            if(!Has(data,"deformers") && Has(data,"surface_bindings")) {
+                for(const auto &binding:Array(Field(data,"surface_bindings")))skins.push_back(binding);
+                std::stable_sort(skins.begin(),skins.end(),[](const JsValue &a,const JsValue &b) {
+                    return (Has(a,"modifier_index")?Integer(Field(a,"modifier_index")):0) <
+                           (Has(b,"modifier_index")?Integer(Field(b,"modifier_index")):0);
+                });
+            }
+            ShapeKeys(node,data,mesh,points.size());
+            if(skins.empty() || Has(skins.front(),"bind_matrix") || (Has(skins.front(),"type") && Str(skins.front(),"type")!="skin")) {
                 auto follow=SkinProvider(node,nullptr,"follow_"+node.name,true);
                 Chain("mesh_"+node.name,mesh.GetPath().AppendProperty(TfToken("points"))).AddMatrixMover("follow",follow,{},{},TfToken("final"));
-                continue;
             }
             for(size_t skinIndex=0;skinIndex<skins.size();++skinIndex) {
             const auto &skin=skins[skinIndex];
+            if(Has(skin,"type") && Str(skin,"type")!="skin" && Str(skin,"type")!="surfaceBinding") {
+                Deformer(node,skin,mesh.GetPath().AppendProperty(TfToken("points")),skinIndex);
+                continue;
+            }
+            if(Has(skin,"bind_matrix")) {
+                SurfaceBinding(node,skin,mesh.GetPath().AppendProperty(TfToken("points")),skinIndex);
+                continue;
+            }
             const auto method=Str(skin,"method");
             if(method!="classicLinear" && method!="dualQuaternion") throw std::runtime_error("unsupported skinning method: "+method);
             std::vector<SdfPath> palette;
@@ -1151,7 +1414,7 @@ public:
                 op.SetJointInfluences(jointIndices,weights,static_cast<int>(slotsPerPoint));
                 op.SetSkinningMethod(TfToken(Str(skin,"method")));
             } else {
-                auto op=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Movers").AppendChild(TfToken(chainName)).AppendChild(TfToken("deform")),TfToken("RigExecBlenderArmatureMover"));
+                auto op=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Movers").AppendChild(TfToken(chainName)).AppendChild(TfToken("deform")),TfToken("RigExecLayeredSkinMover"));
                 op.ApplyAPI(TfToken("RigExecMoverAPI"));
                 op.SetRelationship(TfToken("rigExec:moves"),{target});
                 op.SetRelationship(TfToken("rigExec:influences"),SdfPathVector(palette.begin(),palette.end()));
@@ -1171,6 +1434,59 @@ public:
             }
         }
     }
+    void BipedPicker(const JsValue &data, const Node &owner, const SdfPath &path) {
+        const auto plugin=PlugRegistry::GetInstance().GetPluginWithName("usdBlenderRig");
+        if(!plugin)throw std::runtime_error("native biped picker resource plugin unavailable");
+        auto resource=SdfLayer::FindOrOpen(plugin->GetResourcePath()+"/biped_picker.usda");
+        if(!resource || !SdfCopySpec(resource,SdfPath("/Template"),stage->GetRootLayer(),path))
+            throw std::runtime_error("native biped picker resource unavailable");
+        std::map<std::string,SdfPath> controls;
+        std::set<std::string> inventoryIds;
+        for(const auto &entry:Array(Field(Field(data,"inventory"),"controls"))) {
+            auto &node=Find(Str(entry,"id"));
+            if(node.kind!="joint" || !Has(node.data,"armature") ||
+               Str(node.data,"armature")!=owner.id || node.controlPath==node.path ||
+               stage->GetPrimAtPath(node.controlPath).GetTypeName()!=TfToken("RigExecControl"))
+                throw std::runtime_error("biped inventory target is not an editable control of its owner: "+node.id);
+            if(!inventoryIds.insert(node.id).second || !controls.emplace(Str(entry,"name"),node.controlPath).second)
+                throw std::runtime_error("duplicate biped source control inventory");
+        }
+        auto picker=stage->GetPrimAtPath(path);
+        picker.SetCustomDataByKey(TfToken("blender:controlInventory"),VtValue(JsWriteToString(Field(data,"inventory"))));
+        picker.SetCustomDataByKey(TfToken("blender:controlCount"),VtValue(int(controls.size())));
+        std::set<std::string> represented;
+        for(const auto &page:Array(Field(data,"pages")))
+            for(const auto &button:Array(Field(page,"buttons")))
+                for(const auto &id:Array(Field(button,"controls"))) {
+                    const auto key=String(id);
+                    if(!inventoryIds.count(key))throw std::runtime_error("biped library includes control outside source inventory");
+                    if(!represented.insert(key).second)throw std::runtime_error("biped library repeats source control");
+                }
+        if(represented!=inventoryIds)throw std::runtime_error("biped library omits source control inventory entries");
+        for(const auto &panel:picker.GetChildren()) for(const auto &button:panel.GetChildren()) {
+            // SdfCopySpec preserves authored absolute targets; remap native
+            // picker button pairs along with the copied subtree.
+            auto mirror=button.GetRelationship(TfToken("rigExec:picker:mirror"));
+            if(mirror) {
+                SdfPathVector peers; mirror.GetTargets(&peers);
+                for(auto &peer:peers) {
+                    peer=peer.ReplacePrefix(SdfPath("/Template"),path);
+                    if(!peer.HasPrefix(path) || !stage->GetPrimAtPath(peer))
+                        throw std::runtime_error("native biped mirror target is outside picker or absent");
+                }
+                mirror.SetTargets(peers);
+            }
+            const auto names=button.GetCustomDataByKey(TfToken("blender:controlNames"));
+            if(!names.IsHolding<VtStringArray>())continue;
+            SdfPathVector targets;
+            for(const auto &name:names.UncheckedGet<VtStringArray>()) {
+                const auto found=controls.find(name);
+                if(found==controls.end())throw std::runtime_error("biped template references absent source control: "+name);
+                targets.push_back(found->second);
+            }
+            button.CreateRelationship(TfToken("rigExec:picker:controls"),false).SetTargets(targets);
+        }
+    }
     void Pickers() {
         if(!Has(scene,"pickers") || Array(Field(scene,"pickers")).empty())return;
         stage->DefinePrim(SdfPath("/Rig/Pickers"),TfToken("Scope"));
@@ -1179,7 +1495,10 @@ public:
         for(const auto &data:Array(Field(scene,"pickers"))) {
             auto &owner=Find(Str(data,"owner"));
             if(!owners.insert(owner.id).second)throw std::runtime_error("duplicate picker owner");
-            auto picker=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Pickers").AppendChild(TfToken(owner.name)),TfToken("RigExecPicker"));
+            const auto pickerPath=SdfPath("/Rig/Pickers").AppendChild(TfToken(owner.name));
+            const bool biped=Has(data,"layout") && Str(data,"layout")=="biped";
+            if(biped)BipedPicker(data,owner,pickerPath);
+            auto picker=rigExec::RigExecSchemaPrim::Define(stage,pickerPath,TfToken("RigExecPicker"));
             picker.SetAttribute(TfToken("ui:label"),VtValue(Str(data,"name")));
             picker.SetAttribute(TfToken("ui:order"),VtValue(pickerOrder++));
             picker.SetRelationship(TfToken("rigExec:picker:rig"),{SdfPath("/Rig")});
@@ -1187,7 +1506,7 @@ public:
             picker.GetPrim().SetCustomDataByKey(TfToken("blender:source"),VtValue(JsWriteToString(data)));
             if(Has(data,"source_ui") && !Str(data,"source_ui").empty())
                 Warn("picker source UI script is retained as metadata and not executed: "+owner.id);
-            int pageOrder=0;
+            int pageOrder=biped ? 2 : 0;
             for(const auto &pageData:Array(Field(data,"pages"))) {
                 auto panel=rigExec::RigExecSchemaPrim::Define(stage,picker.GetPath().AppendChild(TfToken("page_"+std::to_string(pageOrder))),TfToken("RigExecPickerPanel"));
                 panel.SetAttribute(TfToken("ui:label"),VtValue(Str(pageData,"name")));
@@ -1208,7 +1527,7 @@ public:
                     button.SetAttribute(TfToken("ui:fontSize"),VtValue(10.0f));
                     const bool sourceBinding=Has(buttonData,"source") && Has(Field(buttonData,"source"),"binding");
                     if(sourceBinding)
-                        Warn("picker binding is selection-only; settings and operators are not translated: "+Str(buttonData,"label"));
+                        Warn((biped ? "picker setting unavailable; source behavior is not translated: " : "picker binding is selection-only; settings and operators are not translated: ")+Str(buttonData,"label"));
                     SdfPathVector targets;
                     std::set<std::string> unique;
                     bool unavailable=false;
@@ -1232,6 +1551,8 @@ public:
                         button.SetAttribute(TfToken("ui:fill"),VtValue(GfVec4f(0.15f,0.15f,0.15f,1)));
                         button.SetAttribute(TfToken("ui:textColor"),VtValue(GfVec4f(0.5f,0.5f,0.5f,1)));
                         button.GetPrim().SetCustomDataByKey(TfToken("blender:unavailable"),VtValue(true));
+                        if(sourceBinding && Has(Field(buttonData,"source"),"unsupported_reason"))
+                            button.GetPrim().SetCustomDataByKey(TfToken("blender:unsupportedReason"),VtValue(Str(Field(buttonData,"source"),"unsupported_reason")));
                     }
                     else if(sourceBinding && !targets.empty())
                         button.SetAttribute(TfToken("ui:text"),VtValue("Select "+Str(buttonData,"label")));
@@ -1322,7 +1643,7 @@ public:
             const auto *target=frame(baseline,*candidate.owner),*source=frame(baseline,*candidate.source);
             if(!target || !source)continue;
             auto mapped=rigExec::RigExecSchemaPrim::Define(stage,SdfPath("/Rig/Mechanisms").AppendChild(
-                TfToken("calibrated_leg_"+candidate.owner->name)),TfToken("RigExecBlenderMappedFrame"));
+                TfToken("calibrated_leg_"+candidate.owner->name)),TfToken("RigExecMappedFrame"));
             mapped.SetAttribute(TfToken("inputs:targetRest"),VtValue(matrix(*target)));
             mapped.SetAttribute(TfToken("inputs:sourceRest"),VtValue(matrix(*source)));
             mapped.SetRelationship(TfToken("rigExec:source"),{candidate.source->path});
@@ -1343,9 +1664,10 @@ public:
         stage->SetStartTimeCode(Number(Field(scene,"start"))); stage->SetEndTimeCode(Number(Field(scene,"end")));
         for(const auto &v:Array(Field(scene,"diagnostics"))) Warn(String(v));
         for(const auto &v:Array(Field(scene,"dependencies"))) Asset(String(v));
-        if(!metadataOnly) { Graph(); Constraints(); Guides(); Materials(); Geometry(); Pickers(); }
+        if(!metadataOnly) { Graph(); Constraints(); Guides(); Materials(); Lattices(); Geometry(); Pickers(); }
         if(!operationOrder.empty()) stage->GetPrimAtPath(SdfPath("/Rig/Movers")).SetChildrenReorder(operationOrder);
         auto root=stage->GetPrimAtPath(SdfPath("/Rig"));
+        root.GetAttribute(TfToken("rigExec:baked")).Set(true);
         root.SetCustomDataByKey(TfToken("rigExec:connectedPoseSeedReuse"),VtValue(true));
         stage->SetDefaultPrim(root);
         if(!metadataOnly) CalibrateInertLegChains();

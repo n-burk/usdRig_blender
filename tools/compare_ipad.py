@@ -18,7 +18,7 @@ import numpy as np
 from pxr import Usd, UsdGeom
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests'))
-from compareRigReference import compare_pose
+from compareRigReference import compare_pose, resolve_edit_attribute
 
 
 def write(path, data):
@@ -41,12 +41,14 @@ def prepare(args):
         relation = provider.GetRelationship('blender:channelControl')
         targets = relation.GetTargets() if relation else []
         edit_providers[ident] = stage.GetPrimAtPath(targets[0]) if len(targets) == 1 else provider
+    meshes = {p.GetCustomDataByKey('blender:id'): p for p in stage.Traverse()
+              if p.IsA(UsdGeom.Mesh) and p.GetCustomDataByKey('blender:id')}
     poses = []
     bones = set()
     measured_drags = [row for row in desktop['drags'] if row.get('control')]
     if reference:
         for pose in reference['poses']:
-            edits = {str(edit_providers[edit['id']].GetPath()) + '.avars:' + edit['channel']: edit['value']
+            edits = {str(resolve_edit_attribute(edit, edit_providers, meshes).GetPath()): edit['value']
                      for edit in pose['edits']}
             poses.append({'name': pose['name'], 'edits': edits})
             bones.update(str(providers[ident].GetPath()) for ident in pose['bones'] if ident in providers)

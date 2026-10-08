@@ -9,12 +9,14 @@ import math
 import os
 import re
 import sys
+import tempfile
 
 import bpy
 from mathutils import Euler, Matrix, Vector
-from mathutils.bvhtree import BVHTree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from materials import Textures, extract as extract_material
+from picker import ellie_picker
+from surface_bind import read_surface_bindings, read_corrective_bindings
 
 
 def matrix(value):
@@ -60,6 +62,9 @@ def picker_data(obj):
     """
     if obj.type != "ARMATURE":
         return []
+    native = ellie_picker(obj, object_id, bone_id)
+    if native is not None:
+        return [native]
     collections = list(getattr(obj.data, "collections_all", []))
 
     def members(collection):
@@ -160,9 +165,11 @@ def bind_mesh(obj):
     temporary = obj.copy()
     raw = obj.data.copy()
     temporary.data = raw
+    temporary.hide_viewport = False
     temporary.animation_data_clear()
     temporary.shape_key_clear()
     bpy.context.scene.collection.objects.link(temporary)
+    temporary.hide_set(False)
     try:
         for index, mod in reversed(list(enumerate(temporary.modifiers))):
             if index not in selected:
@@ -177,73 +184,44 @@ def bind_mesh(obj):
         bpy.data.meshes.remove(raw)
 
 
-def surface_deform_skin(obj, mesh, modifier):
-    """Transfer a bound cage's bone weights to a Surface Deform mesh.
+def saved_surface_bindings(objects):
+    if not any(m.show_viewport and ((m.type == "SURFACE_DEFORM" and m.is_bound) or
+                                   (m.type == "CORRECTIVE_SMOOTH" and m.is_bind))
+               for obj in objects for m in obj.modifiers):
+        return {}, {}
+    # RNA deliberately does not expose the bind arrays. Ask the same Blender
+    # version to serialize a temporary copy and interpret its own SDNA.
+    with tempfile.TemporaryDirectory(prefix="usd-surface-bind-") as directory:
+        path = os.path.join(directory, "bindings.blend")
+        bpy.ops.wm.save_as_mainfile(filepath=path, copy=True, compress=False)
+        return read_surface_bindings(path), read_corrective_bindings(path)
 
-    This preserves the cage's rigid/root motion and gives the teeth their
-    deforming bone hierarchy. Nearest cage triangles approximate Blender's
-    Surface Deform bind weights for local, nonrigid cage motion.
-    """
+
+def surface_binding(obj, mesh, modifier, saved):
     target = modifier.target
-    if not modifier.is_bound or not target or target.type != "MESH" or modifier.strength != 1:
+    binding = saved.get((obj.name, modifier.name))
+    if not modifier.is_bound or not target or target.type != "MESH" or not binding:
         return None
-    active = [m for m in target.modifiers if m.show_viewport]
-    if len(active) != 1 or active[0].type != "ARMATURE":
+    if binding["source_count"] != len(mesh.vertices):
         return None
-    armature = active[0]
-    if not armature.object or armature.use_bone_envelopes or not armature.use_vertex_groups or armature.vertex_group:
-        return None
-    cage = target.data
-    groups = {group.index: group.name for group in target.vertex_groups}
-    weighted = {groups[g.group] for v in cage.vertices for g in v.groups if g.weight > 0 and g.group in groups}
-    palette = [bone for bone in armature.object.data.bones if bone.use_deform and bone.name in weighted]
-    if not palette or not cage.polygons:
-        return None
-    indices = {bone.name: i for i, bone in enumerate(palette)}
-    cage_weights = []
-    for vertex in cage.vertices:
-        row = {indices[groups[g.group]]: float(g.weight) for g in vertex.groups
-               if g.group in groups and groups[g.group] in indices and g.weight > 0}
-        total = sum(row.values())
-        if total <= 1e-8:
-            return None
-        cage_weights.append({i: weight / total for i, weight in row.items()})
-    positions = [target.matrix_world @ vertex.co for vertex in cage.vertices]
-    triangles = []
-    for polygon in cage.polygons:
-        corners = list(polygon.vertices)
-        triangles.extend((corners[0], corners[i], corners[i + 1])
-                         for i in range(1, len(corners) - 1))
-    if not triangles:
-        return None
-    bvh = BVHTree.FromPolygons(positions, triangles, all_triangles=True)
-    rows = []
-    for vertex in mesh.vertices:
-        nearest, _, triangle_index, _ = bvh.find_nearest(obj.matrix_world @ vertex.co)
-        if nearest is None:
-            return None
-        a, b, c = (positions[index] for index in triangles[triangle_index])
-        v0, v1, v2 = b - a, c - a, nearest - a
-        d00, d01, d11 = v0.dot(v0), v0.dot(v1), v1.dot(v1)
-        d20, d21 = v2.dot(v0), v2.dot(v1)
-        denominator = d00 * d11 - d01 * d01
-        if abs(denominator) < 1e-14:
-            return None
-        wb = (d11 * d20 - d01 * d21) / denominator
-        wc = (d00 * d21 - d01 * d20) / denominator
-        weights = {}
-        for index, barycentric in zip(triangles[triangle_index], (1 - wb - wc, wb, wc)):
-            for bone_index, weight in cage_weights[index].items():
-                weights[bone_index] = weights.get(bone_index, 0.0) + barycentric * weight
-        total = sum(max(0.0, weight) for weight in weights.values())
-        if total <= 1e-8:
-            return None
-        rows.append([[index, max(0.0, weight) / total] for index, weight in sorted(weights.items())
-                     if weight > 1e-8])
-    return {"influences": [bone_id(armature.object, bone.name) for bone in palette],
-            "weights": rows, "method": "classicLinear", "mask": [], "use_base_input": False,
-            "source": {"type": "SURFACE_DEFORM", "target": object_id(target),
-                       "approximation": "nearest cage triangle bone weights"}}
+    result = dict(binding, target=object_id(target), strength=float(modifier.strength),
+                  name=modifier.name)
+    group = obj.vertex_groups.get(modifier.vertex_group)
+    result["mask"] = []
+    if group:
+        for vertex in mesh.vertices:
+            weight = next((g.weight for g in vertex.groups if g.group == group.index), 0.0)
+            result["mask"].append(1.0 - weight if modifier.invert_vertex_group else weight)
+    return result
+
+
+def vertex_mask(obj, vertices, name, invert=False):
+    group = obj.vertex_groups.get(name)
+    if not group:
+        return []
+    weights = [next((g.weight for g in vertex.groups if g.group == group.index), 0.0)
+               for vertex in vertices]
+    return [1.0 - w for w in weights] if invert else weights
 
 
 def snapshot():
@@ -254,15 +232,53 @@ def snapshot():
     nodes = []
     constraints = []
     meshes = []
+    lattices = []
     materials = []
     pickers = []
     objects = sorted(scene.objects, key=object_id)
     for obj in objects:
         pickers.extend(picker_data(obj))
     object_ids = {object_id(obj) for obj in objects}
+    saved_bindings, corrective_bindings = saved_surface_bindings(objects)
 
     def warn(text):
         diagnostics.append(text)
+
+    def modifier_mask(obj, mesh, modifier):
+        name = getattr(modifier, "vertex_group", "")
+        preceding = list(obj.modifiers)[:list(obj.modifiers).index(modifier)]
+        mixes = [m for m in preceding if m.show_viewport and m.type == "VERTEX_WEIGHT_MIX"]
+        if not name or not any(m.vertex_group_a == name for m in mixes):
+            return vertex_mask(obj, mesh.vertices, name, getattr(modifier, "invert_vertex_group", False))
+        if any(m.mask_texture for m in mixes):
+            warn("texture-dependent vertex-weight masks are not translated: " + obj.name + "/" + modifier.name)
+            return None
+        # Evaluate only the weight modifiers on the prepared constant topology.
+        # The snapshot stores their current values; source drivers stay diagnosed.
+        temporary, raw = obj.copy(), mesh.copy()
+        temporary.data = raw
+        temporary.animation_data_clear()
+        temporary.hide_viewport = False
+        bpy.context.scene.collection.objects.link(temporary)
+        temporary.hide_set(False)
+        try:
+            keep = {m.name for m in mixes}
+            for m in list(temporary.modifiers):
+                if m.name not in keep:
+                    temporary.modifiers.remove(m)
+            bpy.context.view_layer.update()
+            graph = bpy.context.evaluated_depsgraph_get()
+            evaluated = temporary.evaluated_get(graph)
+            result = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=graph)
+            try:
+                mask = vertex_mask(temporary, result.vertices, name, getattr(modifier, "invert_vertex_group", False))
+            finally:
+                evaluated.to_mesh_clear()
+        finally:
+            bpy.data.objects.remove(temporary, do_unlink=True)
+            bpy.data.meshes.remove(raw)
+        warn("vertex-weight mask captured at the saved frame; weight edits and drivers are not translated: " + obj.name + "/" + modifier.name)
+        return mask
 
     def animation(data, label):
         anim = getattr(data, "animation_data", None)
@@ -293,6 +309,16 @@ def snapshot():
                 item["source"] = active[0]["source"]
             for key in ("use_deform_preserve_volume", "use_bone_envelopes", "use_current_location"):
                 item[key] = getattr(con, key)
+        if con.type == "TRANSFORM":
+            for key in ("map_from", "map_to", "map_to_x_from", "map_to_y_from", "map_to_z_from",
+                        "use_motion_extrapolate", "from_rotation_mode", "to_euler_order", "mix_mode_rot", "mix_mode_scale"):
+                item[key] = getattr(con,key)
+            for role in ("from","to"):
+                for bound in ("min","max"):
+                    for axis in "xyz":
+                        for suffix in ("","_rot","_scale"):
+                            key = role+"_"+bound+"_"+axis+suffix
+                            item[key] = float(getattr(con,key))
         for key in ("use_x", "use_y", "use_z", "invert_x", "invert_y", "invert_z",
                     "use_offset", "mix_mode", "head_tail", "chain_count", "use_tail",
                     "use_stretch", "use_location", "use_rotation", "pole_angle",
@@ -422,7 +448,7 @@ def snapshot():
                 node = {"id": bone_id(obj, bone.name), "name": bone.name, "kind": "joint",
                         "parent": bone_id(obj, bone.parent.name) if bone.parent else oid,
                         "rest": matrix(local), "pose": list(t) + [math.degrees(v) for v in r] + list(s),
-                        "length": float(bone.length), "deform": bone.use_deform,
+                        "length": float(bone.length), "deform": bone.use_deform, "rotation_mode": pb.rotation_mode,
                         "visible": obj.visible_get() and not bone.hide and (not bone.collections or any(c.is_visible_effectively for c in bone.collections))}
                 node["bbone_segments"] = bone.bbone_segments
                 node["ik_stretch"] = float(pb.ik_stretch)
@@ -435,30 +461,135 @@ def snapshot():
                     warn("B-Bone segment deformation is not translated: " + obj.name + "/" + bone.name)
                 for con in pb.constraints:
                     constraint(node["id"], con)
-        elif obj.type not in {"MESH", "EMPTY"}:
+        elif obj.type not in {"MESH", "EMPTY", "LATTICE"}:
             warn("object data is not translated: " + obj.name + " (" + obj.type + ")")
+
+        if obj.type == "LATTICE":
+            lattice = obj.data
+            if lattice.shape_keys:
+                warn("lattice shape keys are not translated: " + obj.name)
+            hooks = []
+            for mod in obj.modifiers:
+                if not mod.show_viewport:
+                    continue
+                if mod.type != "HOOK" or not mod.object or (mod.falloff_radius != 0 and mod.falloff_type != "NONE"):
+                    warn("lattice modifier is not translated: " + obj.name + "/" + mod.name)
+                    continue
+                mask = vertex_mask(obj, lattice.points, mod.vertex_group, mod.invert_vertex_group)
+                selected = set(mod.vertex_indices)
+                if not selected and not mask:
+                    continue  # Blender Hook with neither selection nor group is inert.
+                if selected:
+                    mask = [(mask[i] if mask else 1.0) if i in selected else 0.0
+                            for i in range(len(lattice.points))]
+                inverse = mod.matrix_inverse.copy()
+                # Blender's float inverse can leave the homogeneous affine row
+                # at 1 +/- one float ulp; preserve the affine map it represents.
+                if max(abs(inverse[3][i]) for i in range(3)) > 1e-6 or abs(inverse[3][3]-1) > 1e-6:
+                    warn("non-affine lattice Hook bind matrix is not translated: " + obj.name + "/" + mod.name)
+                    continue
+                inverse[3] = (0, 0, 0, 1)
+                hooks.append({"name": mod.name, "source": bone_id(mod.object, mod.subtarget)
+                              if mod.object.type == "ARMATURE" and mod.subtarget in mod.object.data.bones
+                              else object_id(mod.object), "inverse": matrix(inverse),
+                              "mask": mask, "strength": float(mod.strength)})
+            dimensions = [lattice.points_u, lattice.points_v, lattice.points_w]
+            regular = [list(p.co) for p in lattice.points]
+            origin = regular[0]
+            strides = [1, dimensions[0], dimensions[0]*dimensions[1]]
+            spacing = [(regular[strides[a]][a] - origin[a]) if dimensions[a] > 1 else 1.0 for a in range(3)]
+            lattices.append({"id": oid, "points": [list(p.co_deform) for p in lattice.points],
+                             "divisions": dimensions, "origin": origin, "spacing": spacing,
+                             "interpolation": [getattr(lattice, "interpolation_type_"+a) for a in "uvw"],
+                             "vertex_group": lattice.vertex_group, "hooks": hooks})
 
         if obj.type != "MESH" or obj in shape_objects or (not obj.visible_get() and not obj.data.polygons):
             continue
         mesh = obj.data
-        if mesh.shape_keys:
-            warn("shape keys are not translated: " + obj.name)
         mesh, prepared = bind_mesh(obj)
+        shape_keys = []
+        keys = obj.data.shape_keys
+        if keys:
+            if not keys.use_relative or prepared:
+                warn("absolute shape keys or shape keys with prepared topology are not translated: " + obj.name)
+            else:
+                animation(keys, obj.name + " shape keys")
+                for key in keys.key_blocks:
+                    if key == keys.reference_key:
+                        continue
+                    if len(key.data) != len(mesh.vertices) or len(key.relative_key.data) != len(mesh.vertices):
+                        warn("shape key topology is incompatible: " + obj.name + "/" + key.name)
+                        continue
+                    mask = vertex_mask(obj, mesh.vertices, key.vertex_group, False)
+                    deltas = [(p.co-q.co) * (0.0 if key.mute else mask[i] if mask else 1.0)
+                              for i, (p,q) in enumerate(zip(key.data,key.relative_key.data))]
+                    shape_keys.append({"name": key.name, "value": float(key.value), "mute": bool(key.mute),
+                                       "minimum": float(key.slider_min), "maximum": float(key.slider_max),
+                                       "deltas": [list(v) for v in deltas]})
         active_modifiers = [mod for mod in obj.modifiers if mod.show_viewport]
         armatures = [mod for mod in active_modifiers if mod.type == "ARMATURE" and mod.object]
-        surface_skin = None
-        if not armatures:
-            surfaces = [mod for mod in active_modifiers if mod.type == "SURFACE_DEFORM"]
-            if len(surfaces) == 1 and active_modifiers[0] == surfaces[0]:
-                surface_skin = surface_deform_skin(obj, mesh, surfaces[0])
+        surfaces = []
+        surface_names = set()
+        deformers = []
+        for mod in active_modifiers:
+            if mod.type == "SURFACE_DEFORM":
+                binding = surface_binding(obj, mesh, mod, saved_bindings)
+                if binding is not None:
+                    binding["modifier_index"] = active_modifiers.index(mod)
+                    surfaces.append(binding)
+                    surface_names.add(mod.name)
+        for mod in active_modifiers:
+            base = {"name": mod.name, "modifier_index": active_modifiers.index(mod)}
+            mask = modifier_mask(obj, mesh, mod) if mod.type in {"CORRECTIVE_SMOOTH", "SHRINKWRAP", "LATTICE"} else []
+            if mask is None:
+                continue
+            if mod.type == "CORRECTIVE_SMOOTH":
+                rest = corrective_bindings.get((obj.name, mod.name)) if mod.rest_source == "BIND" else [list(v.co) for v in obj.data.vertices]
+                if mod.use_only_smooth:
+                    rest = [list(v.co) for v in mesh.vertices]
+                if rest is None or len(rest) != len(mesh.vertices) or (not mod.use_only_smooth and mod.rest_source == "ORCO" and (obj.data.shape_keys or prepared)):
+                    warn("corrective smoothing reference is unavailable or incompatible: " + obj.name + "/" + mod.name)
+                    continue
+                deformers.append(dict(base, type="deltaMush", rest_points=rest,
+                    factor=float(mod.factor), iterations=int(mod.iterations), detail=float(mod.scale),
+                    smoothing="simple" if mod.smooth_type == "SIMPLE" else "lengthWeighted",
+                    pin_boundary=mod.use_pin_boundary, only_smooth=mod.use_only_smooth, mask=mask,
+                    edges=[i for edge in mesh.edges for i in edge.vertices]))
+                surface_names.add(mod.name)
+            elif mod.type == "SHRINKWRAP":
+                if mod.wrap_method != "NEAREST_SURFACEPOINT" or mod.wrap_mode == "ABOVE_SURFACE" or not mod.target or mod.target.type != "MESH":
+                    continue
+                target_mesh, _ = bind_mesh(mod.target)
+                try:
+                    target_mesh.calc_loop_triangles()
+                    triangles = [i for triangle in target_mesh.loop_triangles for i in triangle.vertices]
+                    if any(len(p.vertices) > 3 for p in target_mesh.polygons) and any(
+                            m.show_viewport and m.type not in {"MIRROR", "MASK"}
+                            and not (m.type == "SUBSURF" and m.levels == 0) for m in mod.target.modifiers):
+                        warn("shrinkwrap target polygon tessellation captured at the saved topology; deformation can change triangulation: " + obj.name + "/" + mod.name)
+                finally:
+                    if target_mesh != mod.target.data:
+                        bpy.data.meshes.remove(target_mesh)
+                mode = {"ON_SURFACE": "onSurface", "INSIDE": "inside", "OUTSIDE": "outside",
+                        "OUTSIDE_SURFACE": "outsideSurface"}[mod.wrap_mode]
+                deformers.append(dict(base, type="shrinkwrap", target=object_id(mod.target),
+                                     mode=mode, offset=float(mod.offset), mask=mask, triangles=triangles))
+                surface_names.add(mod.name)
+            elif mod.type == "LATTICE" and mod.object and mod.object.type == "LATTICE":
+                if mod.object.data.vertex_group or mod.object.data.shape_keys:
+                    warn("lattice data group or shape keys are not translated: " + obj.name + "/" + mod.name)
+                    continue
+                deformers.append(dict(base, type="lattice", cage=object_id(mod.object),
+                                     mask=mask, strength=float(mod.strength)))
+                surface_names.add(mod.name)
         for mod in active_modifiers:
             if mod.name in prepared:
                 # Parameters stay in sourceData; topology is the bind mesh.
                 continue
             if mod.type == "SUBSURF" and mod.levels == 0:
                 continue
-            if mod.type == "SURFACE_DEFORM" and surface_skin is not None:
-                warn("Surface Deform uses approximate cage bone weights: " + obj.name + "/" + mod.name)
+            if mod.name in surface_names:
+                continue
             elif mod.type != "ARMATURE":
                 warn("modifier is not translated: " + obj.name + "/" + mod.name + " (" + mod.type + ")")
             elif not mod.object:
@@ -496,11 +627,10 @@ def snapshot():
                 skin["use_base_input"] = bool(mod.use_multi_modifier and previous >= 0 and active_modifiers[previous].type == "ARMATURE")
                 if skin["use_base_input"] and any(m.type != "ARMATURE" for m in active_modifiers[:previous]):
                     warn("multi-armature cache after other modifiers is not translated: " + obj.name + "/" + mod.name)
+                skin["modifier_index"] = active_modifiers.index(mod)
                 skins.append(skin)
                 if mod.use_deform_preserve_volume:
                     warn("preserve-volume skinning mapped to native DQ; Blender scale and bend parity is not established: " + obj.name)
-        if surface_skin is not None:
-            skins.append(surface_skin)
         uv = []
         render_uv = next((layer for layer in mesh.uv_layers if layer.active_render), mesh.uv_layers.active)
         if render_uv:
@@ -508,7 +638,7 @@ def snapshot():
         uv_sets = {layer.name: [list(v.uv) for v in layer.data] for layer in mesh.uv_layers}
         if mesh.has_custom_normals:
             warn("custom split normals are not translated: " + obj.name)
-        meshes.append({"id": oid, "points": [list(v.co) for v in mesh.vertices],
+        meshes.append({"id": oid, "points": [list(v.co) for v in mesh.vertices], "shape_keys": shape_keys,
                        "counts": [len(p.vertices) for p in mesh.polygons],
                        "indices": [i for p in mesh.polygons for i in p.vertices], "uv": uv, "uv_sets": uv_sets,
                        "uv_active": mesh.uv_layers.active.name if mesh.uv_layers.active else "",
@@ -517,7 +647,11 @@ def snapshot():
                        "materials": [material_id(slot.material) if slot.material else "" for slot in obj.material_slots],
                        "material_indices": [p.material_index for p in mesh.polygons],
                        "bind_topology": [{"name": mod.name, "type": mod.type} for mod in active_modifiers if mod.name in prepared],
-                       "skin": skins[0] if len(skins) == 1 else None, "skin_stack": skins})
+                       "skin": skins[0] if len(skins) == 1 else None, "skin_stack": skins,
+                       "surface_bindings": surfaces,
+                       "deformers": sorted([dict(s, type="skin") for s in skins] +
+                                           [dict(s, type="surfaceBinding") for s in surfaces] + deformers,
+                                           key=lambda m: m["modifier_index"])})
         if mesh != obj.data:
             bpy.data.meshes.remove(mesh)
 
@@ -538,7 +672,7 @@ def snapshot():
     if bpy.data.texts:
         warn("embedded text blocks are not executed or translated")
     return {"format": "usdBlenderRig", "version": 1, "blender_version": bpy.app.version_string,
-            "source": bpy.data.filepath, "meters_per_unit": float(scene.unit_settings.scale_length),
+            "source": bpy.data.filepath, "meters_per_unit": float(scene.unit_settings.scale_length), "lattices": lattices,
             "fps": float(scene.render.fps / scene.render.fps_base), "frame": scene.frame_current,
             "start": scene.frame_start, "end": scene.frame_end, "nodes": nodes,
             "constraints": constraints, "meshes": meshes, "materials": materials,

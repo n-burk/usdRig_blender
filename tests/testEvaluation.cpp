@@ -10,25 +10,45 @@
 #include <iostream>
 #include <stdexcept>
 #include <tuple>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 PXR_NAMESPACE_USING_DIRECTIVE
 #define CHECK(x) do { if(!(x)) throw std::runtime_error("check failed: " #x); } while(false)
 int main(int argc,char **argv) {
     try {
         CHECK(argc==4 || argc==5);
-        PlugRegistry::GetInstance().RegisterPlugins(argv[1]);
+        const bool coreOnly=std::getenv("USDBLENDERRIG_REQUIRE_CORE_ONLY")!=nullptr;
+        if(!coreOnly)PlugRegistry::GetInstance().RegisterPlugins(argv[1]);
         PlugRegistry::GetInstance().RegisterPlugins(argv[2]);
+        const auto noConverterRuntime=[&]() {
+            if(!coreOnly)return;
+            CHECK(!PlugRegistry::GetInstance().GetPluginWithName("usdBlenderRig"));
+#ifdef __APPLE__
+            for(uint32_t i=0;i<_dyld_image_count();++i)
+                CHECK(std::string(_dyld_get_image_name(i)).find("libusdBlenderRig")==std::string::npos);
+#endif
+        };
+        noConverterRuntime();
         auto stage=UsdStage::Open(argv[3]); CHECK(stage);
+        if(coreOnly)for(const auto &prim:stage->Traverse())
+            CHECK(prim.GetTypeName().GetString().find("RigExecBlender")==std::string::npos);
         stage->SetEditTarget(stage->GetSessionLayer());
         rigExec::RigExecRigEvaluator evaluator(stage,SdfPath("/Rig"));
         std::vector<std::string> errors;
         bool compiled=evaluator.Compile(&errors);
         for(const auto &error:errors) std::cerr<<error<<'\n'; CHECK(compiled); CHECK(errors.empty());
         std::map<std::string,SdfPath> nodes,meshes;
+        std::map<std::pair<std::string,std::string>,SdfPath> shapeChannels;
         for(const auto &prim:stage->Traverse()) {
             auto id=prim.GetCustomDataByKey(TfToken("blender:id"));
             if(id.IsHolding<std::string>()) {
-                if(prim.GetTypeName()==TfToken("Mesh")) meshes[id.Get<std::string>()]=prim.GetPath();
+                if(prim.GetTypeName()==TfToken("Mesh") || prim.GetTypeName()==TfToken("Points")) meshes[id.Get<std::string>()]=prim.GetPath();
                 else nodes[id.Get<std::string>()]=prim.GetPath();
+                if(prim.GetTypeName()==TfToken("Mesh"))for(const auto &attr:prim.GetAttributes()) {
+                    auto key=attr.GetCustomDataByKey(TfToken("blender:shapeKey"));
+                    if(key.IsHolding<std::string>())shapeChannels[{id.Get<std::string>(),key.Get<std::string>()}]=attr.GetPath();
+                }
             }
         }
         std::map<std::string,SdfPath> channels=nodes;
@@ -158,12 +178,16 @@ int main(int argc,char **argv) {
             std::string mesh=reference.at("mesh").GetString();
             const double tolerance=reference.at("tolerance").GetReal();
             const bool incremental=std::getenv("USDBLENDERRIG_INCREMENTAL_POSES")!=nullptr;
-            std::map<SdfPath,double> initialChannels;
+            const auto editAttribute=[&](const JsObject &e) {
+                if(e.count("shape_key"))return stage->GetAttributeAtPath(shapeChannels.at({e.at("id").GetString(),e.at("shape_key").GetString()}));
+                return stage->GetPrimAtPath(channels.at(e.at("id").GetString())).GetAttribute(TfToken("avars:"+e.at("channel").GetString()));
+            };
+            std::map<SdfPath,VtValue> initialChannels;
             if(incremental)for(const auto &data:reference.at("poses").GetJsArray())
                 for(const auto &edit:data.GetJsObject().at("edits").GetJsArray()) {
                     const auto &e=edit.GetJsObject();
-                    auto attr=stage->GetPrimAtPath(channels.at(e.at("id").GetString())).GetAttribute(TfToken("avars:"+e.at("channel").GetString()));
-                    double value;CHECK(attr.Get(&value));initialChannels.emplace(attr.GetPath(),value);
+                    auto attr=editAttribute(e);
+                    VtValue value;CHECK(attr.Get(&value));initialChannels.emplace(attr.GetPath(),value);
                 }
             for(const auto &data:reference.at("poses").GetJsArray()) {
                 const auto &pose=data.GetJsObject();
@@ -171,8 +195,9 @@ int main(int argc,char **argv) {
                 else stage->GetSessionLayer()->Clear();
                 for(const auto &edit:pose.at("edits").GetJsArray()) {
                     const auto &e=edit.GetJsObject();
-                    auto prim=stage->GetPrimAtPath(channels.at(e.at("id").GetString()));
-                    CHECK(prim.GetAttribute(TfToken("avars:"+e.at("channel").GetString())).Set(e.at("value").GetReal()));
+                    auto attr=editAttribute(e);
+                    if(e.count("shape_key"))CHECK(attr.Set(float(e.at("value").GetReal())));
+                    else CHECK(attr.Set(e.at("value").GetReal()));
                 }
                 JsArray samples;
                 if(pose.count("meshes")) samples=pose.at("meshes").GetJsArray();
@@ -187,6 +212,21 @@ int main(int argc,char **argv) {
                 }
                 std::cout<<pose.at("name").GetString()<<" / "<<record.at("mesh").GetString()<<": max vertex error "<<maximum<<" (tolerance "<<tolerance<<")\n";
                 CHECK(maximum<=tolerance);
+                }
+                if(pose.count("frames")) {
+                    const auto evaluated=evaluator.Evaluate(UsdTimeCode::Default());CHECK(evaluated.valid);
+                    for(const auto &sample:pose.at("frames").GetJsArray()) {
+                        const auto &record=sample.GetJsObject();
+                        const auto &actual=evaluated.controlFrames.at(nodes.at(record.at("id").GetString()));
+                        const auto &expected=record.at("points").GetJsArray();CHECK(expected.size()==4);
+                        double maximum=0;
+                        for(size_t i=0;i<4;++i) {
+                            const auto &xyz=expected[i].GetJsArray();
+                            maximum=std::max(maximum,(actual.points[i]-GfVec3d(xyz[0].GetReal(),xyz[1].GetReal(),xyz[2].GetReal())).GetLength());
+                        }
+                        std::cout<<pose.at("name").GetString()<<" / frame "<<record.at("id").GetString()<<": max error "<<maximum<<'\n';
+                        CHECK(maximum<=tolerance);
+                    }
                 }
             }
             if(incremental)std::cout<<"Incremental avar edits match Blender without a layer clear or recompile\n";
@@ -205,6 +245,7 @@ int main(int argc,char **argv) {
                 std::cout<<"Diagnosed collapsed-stretch guard and recovery passed\n";
             }
             stage->GetSessionLayer()->Clear();
+            if(!coreOnly) {
             const auto referencePath=std::filesystem::path(argv[4]);
             const auto output=referencePath.parent_path()/(referencePath.stem()=="reference" ? "converted.usda" : referencePath.stem().string()+"-converted.usda");
             CHECK(stage->GetRootLayer()->Export(output.string()));
@@ -212,7 +253,10 @@ int main(int argc,char **argv) {
             rigExec::RigExecRigEvaluator nativeEvaluator(native,SdfPath("/Rig"));
             CHECK(nativeEvaluator.Compile(&errors)); CHECK(nativeEvaluator.Evaluate(UsdTimeCode::Default()).valid);
             std::cout<<"Source "<<argv[3]<<" matches Blender; native USD reopening passed\n";
+            }
         }
+        noConverterRuntime();
+        if(coreOnly)std::cout<<"Exported native USD matches Blender in a fresh process with converter plugin absent\n";
         return 0;
     } catch(const std::exception &e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

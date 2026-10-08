@@ -3,15 +3,15 @@
 A read-only OpenUSD `SdfFileFormat` plugin that opens Blender `.blend` files as
 native usdRig rigs. It follows the standalone sidecar pattern in
 [`../usdRig_maya`](../usdRig_maya/README.md) and links to
-[`../usdRig`](../usdRig/README.md)'s installed `rigExecRigging`, `rigExec`, and
-`rigExecMath` libraries.
+[`../usdRig`](../usdRig/README.md)'s installed `rigExecRigging` and `rigExec` libraries.
 CMake consumes the installed dependency SDK package.
 
 Blender reads its own binary format in a separate headless process and emits
 a versioned JSON snapshot. The C++ translator authors native RigExec schema
 prims. Blender does not need the usdRig Python module, and its bundled USD
 version does not need to match the host's USD. Exported USD evaluates using
-usdRig and this sidecar's native computation plugin. `.blendrig` snapshots
+usdRig alone. This repository supplies file-format translation only; runtime
+computations, movers, and their schemas are shared core features. `.blendrig` snapshots
 also open directly without Blender. Exported rigs contain no sampled playback
 substitute and never launch Blender while evaluating a pose.
 
@@ -57,19 +57,17 @@ python tools/convert.py character.blend character.usda --strict
 Use the installed resource directory
 `build/install/lib/usd/usdBlenderRig/resources` when deploying the sidecar.
 USD and RigExec shared libraries must remain discoverable by the platform
-loader. After installing this sidecar, launch `bin/usdview.sh character.usdz`.
-This loads the SDK selected by CMake and the sidecar's native computations.
-The configured SDK prefix is recorded in `build/rigexec-prefix`; set
-`USDBLENDERRIG_RIGEXEC_PREFIX` to override it when testing another installation.
-Picker selection and gizmo edits use the stock usdRig viewer. Reconvert older
-exports to obtain the native picker controls; removing the companion alone does
-not change controls already authored in an older USD layer.
-
-The sibling `usdRig_ios` build includes this sidecar's `nativeFrames.cpp` and
-`nativeSkin.cpp` in its native runtime and embeds the `UsdBlenderRig` schema
-resources. Rebuild that runtime before opening exported USDC/USDZ rigs on iOS;
-the mobile viewer does not need Blender to evaluate them. Its stock usdRig
-picker and gizmo consume the same native control and space switch contract.
+loader. The converter plugin is needed only when opening `.blend` or
+`.blendrig` source files. Exported USDC/USDZ rigs, their pickers, and their
+computations run in the ordinary usdRig desktop or iOS runtime without this
+repository's plugin or Blender. The helper `bin/usdview.sh` registers the
+file-format plugin only for source files and otherwise selects the SDK recorded
+in `build/rigexec-prefix`; set `USDBLENDERRIG_RIGEXEC_PREFIX` to test another SDK.
+Reconvert older exports to obtain current native picker controls. Existing exports using the former runtime type names must be upgraded with
+`tools/migrate_runtime.py`; core contains no converter-specific aliases. New exports
+use the shared `RigExecBoneFrame`, `RigExecConstraintFrame`, `RigExecCopyFrame`,
+`RigExecMappedFrame`, `RigExecSkinInfluence`, `RigExecArmatureParent`, and
+`RigExecLayeredSkinMover` types.
 
 ```python
 from pxr import Sdf, Usd
@@ -99,7 +97,12 @@ as metadata. Legacy snapshots with zero wire width use the same extent rule.
 Generated IK endpoint joints have their guides hidden, so their schema-default
 radius cannot cover the character. Texture file attributes carry the authored
 color space as metadata in addition to the UsdUVTexture input.
-Generated rigs opt into usdRig connected-pose seed reuse. Their declared
+Generated rigs enable `rigExec:baked` by default to request compiled
+evaluation. This keeps controls editable; it does not bake animation into
+time samples. Unsupported computations may still require dynamic evaluation,
+so the flag alone does not guarantee reduced memory or Blender parity.
+Previously exported USD files must be reconverted to pick up this default.
+Generated rigs also opt into usdRig connected-pose seed reuse. Their declared
 provider and attribute inputs allow refreshes to pin current dependency frames
 while avoiding repeated invalidation of the whole execution network. The
 runtime preserves complete override reads for rigs that do not opt in.
@@ -135,17 +138,23 @@ reads still need Blender; their `complete` flag is false.
 | Stretch To | World stacks with influence, PLANE_X/PLANE_Z/SWING_Y orientation, volume modes and smooth bulge limits; almost zero-length stretches are diagnosed and retain the incoming frame |
 | Damped Track | World stacks with influence, all six signed axes and half-turn handling |
 | Limit Rotation | World stacks with influence and all angle limits disabled, reproducing Blender's shear removal; enabled angle limits remain unsupported |
-| Armature constraint | World stacks with influence, weighted targets, linear or dual-quaternion blending and rest/current pivots, without envelopes; preserves owner avars and live armature placement. B-Bone targets use the whole-bone frame with an explicit segment-binding diagnostic |
+| Armature constraint | Bone and object world stacks with influence, weighted targets, linear or dual-quaternion blending and rest/current pivots, without envelopes; preserves owner avars and live armature placement. Object owners bind at their incoming origin, including lattice cages that follow a skinned mesh. B-Bone targets use the whole-bone frame with an explicit segment-binding diagnostic |
 | Constraint order and dependencies | Source stack order, parent-before-child dependencies, explicit cycle rejection |
 | IK without rotation targeting | `RigExecSingleChainIkConstraint`, object-pole mode, bone-basis pole angle and a hidden virtual bone-tail joint; the constraint stretch flag and per-bone stretch values are retained; nonuniform stretch and solver equivalence are diagnosed |
 | Three-hook Spline IK | A native `RigExecSplineIk` follows the three hooked bone controls and maps its virtual chain back to the Blender bones. Hooked Bezier shape, twist and scale are approximate; other Spline IK configurations remain diagnosed |
 | Connected lower-limb IK chains with inert native targets | The translator probes a foot IK control, then maps its affected connected deformation bones through calibrated native source frames. This preserves the saved pose while restoring foot-driven mesh motion; Stretch To length and volume remain approximate |
 | Armature vertex-group skinning | `RigExecSkinMover`, used deform-bone palette, normalized weights, live mesh/armature spaces, zero-weight vertices following their owning object |
-| Masked/chained armatures | Native `RigExecBlenderArmatureMover` revisions; fractional/inverted masks and original-input caching for contiguous multi-modifier chains |
-| Bound Surface Deform over an armature cage | Cage bone weights transferred from the nearest cage triangle to the driven mesh, then evaluated with native skinning. Root motion follows the rig; local nonrigid Surface Deform behavior is approximate and diagnosed |
+| Transform constraints mapping to location | Existing native constraint frame maps evaluated location, XYZ Euler rotation or scale through per-axis ranges, clamping or extrapolation, axis remapping and ADD/REPLACE location mixing. Reads constrained source frames, preserves stack order and world-space influence; other destination or rotation policies remain diagnosed |
+| Masked/chained armatures | Shared `RigExecLayeredSkinMover` revisions; fractional/inverted masks and original-input caching for contiguous multi-modifier chains |
+| Relative mesh shape keys | Existing `RigExecBlendShapeMover` with sparse `UsdSkelBlendShape` offsets before skinning, non-Basis relative keys, group masks and editable signed weights. Saved mute remains static; absolute keys, keys with prepared topology, key animation and key drivers remain diagnosed |
+| Bound Surface Deform | Saved polygon/centroid/corner bindings become native `RigExecSurfaceBindingMover` attributes: indices, generalized barycentric weights, vector offsets and masks. Reads the cage's final points in modifier order, with live object-space conversion; no nearest-triangle weight transfer. Unsupported modifiers on the cage or attachment remain diagnosed |
+| Corrective Smooth | Existing `RigExecDeltaMushMover` with directed corner frames, simple or current edge-length weighting, iterative masks, border pinning, detail scale and smoothing-only output. Saved BIND coordinates come from SDNA; ORCO requires compatible original topology. Smoothing runs in live owner local space |
+| Nearest-surface Shrinkwrap | Existing `RigExecSurfaceMover` with on-surface, inside, outside and outside-surface policies, signed offset and fractional/inverted masks. Source and target spaces follow native frames. Saved target tessellation is explicit; projection, above-surface mode and changing tessellation remain diagnosed |
+| Lattice | Existing `RigExecLatticeMover` evaluates current incoming coordinates against the canonical regular grid, with per-axis linear, B-spline, cardinal or Catmull-Rom interpolation, end-index clamping, masks and strength. Native point cages retain authored deformations and follow object/bone parenting and weighted radius-zero Hooks |
+| Consumed vertex-weight masks | Texture-free VertexWeightMix masks are evaluated by Blender into the snapshot when a supported downstream modifier consumes them. Weight edits and source drivers remain diagnosed; unrelated weight modifiers retain their diagnostics |
 | Preserve Volume | Native dual quaternion skinning, with a Blender-parity diagnostic |
 | Meshes | `UsdGeomMesh` control cages with `subdivisionScheme = "catmullClark"` assumed for every mesh, asset-space bind points, extent, render-active face-varying `st` and all named UV sets; editing/render UV selection metadata is retained |
-| Constant topology modifiers | Pre-deformation Mirror and nonsmooth vertex-group Mask materialized on undeformed bind data; no pose or shape-key geometry captured |
+| Constant topology modifiers | Pre-deformation Mirror and nonsmooth vertex-group Mask materialized on undeformed bind data; including hidden dependency cages; no pose or shape-key geometry captured |
 | Unskinned meshes | Native matrix mover following the owning object control |
 | Bone custom shapes | Mesh-edge or POLY-curve guides live on the editable control; `guide:source` preserves alternate shape-transform bones without creating read-only pick targets |
 | Materials | `UsdPreviewSurface` color, opacity, roughness, metallic, emission and tangent normals; packed/file/UDIM images, named UVs and supported static texture arithmetic are converted to portable PNG assets |
@@ -182,6 +191,12 @@ retain their reversible encoding, preserving distinct named UV sets.
 Mesh bind points include saved object placement; native expressions account
 for live object/armature placement during deformation. Bind topology is fixed;
 editing Mirror/Mask parameters or their driver inputs is not supported.
+Relative shape keys run before this modifier stack. Each mesh exposes a float
+attribute with `blender:shapeKey` custom data containing the source key name;
+editing it updates both signed native sample branches without Blender.
+Offsets use each key's own relative key and saved vertex-group mask. Saved
+muted keys retain zero offsets; changing their mute metadata does not re-enable
+them. Source shape-key animation and drivers remain diagnosed.
 Supported constraint subsequences retain source order when other operations
 are unsupported. Every omitted operation is diagnosed, and the conversion
 remains incomplete. Missing upstream operations can change downstream results
@@ -212,6 +227,13 @@ and are not executable picker actions.
 Embedded UI text is preserved without running it. Separate third-party picker
 formats are not currently imported.
 
+Ellie reuses the native biped Body and Face artwork, with all 766 source
+transform controls represented on collection pages, including hidden FK and
+detail controls. The 115 source behavioral settings are retained on explicit
+unavailable scene metadata because their property drivers are not translated;
+the stock picker hides panels with no live actions. See
+[the Ellie picker contract](docs/ellie-picker.md) for inventory and validation.
+
 Package an exported native layer and its resolved asset dependencies with:
 
 ```sh
@@ -222,7 +244,8 @@ This uses OpenUSD's general USDZ packager and verifies ZIP alignment/CRC,
 dependency resolution, byte-identical concrete UDIM tile sets, native prim types and computation connections, every
 picker page and control target, and unchanged source bytes. A sibling
 `character.package.json` records the result and SHA-256. Native evaluation and
-the picker UI require usdRig and this sidecar plugin; packaging does not add
+the picker UI require only usdRig; this file-format plugin is not a playback
+dependency. Packaging does not add
 sampled playback or certify Blender parity.
 
 ## Diagnostics and limits
@@ -235,10 +258,11 @@ settings, topology, smooth flags and modifiers' diagnostics) as inert JSON.
 Each provider also retains its extracted source record. Dependencies are
 available through `GetExternalAssetDependencies()` and layer custom data.
 
-Unsupported features include shape keys, arbitrary modifiers, bone envelopes,
+Unsupported features include absolute shape keys and keys with prepared topology,
+shape-key animation/drivers, arbitrary modifiers, bone envelopes,
 multi-armature caches following unsupported modifiers, B-Bone segments,
 object vertex parenting, CUSTOM spaces, LOCAL_OWNER_ORIENT owner spaces,
-non-WORLD spaces for non-copy constraints, partial rotation masks, rotation
+non-WORLD spaces for non-copy/non-Transform constraints, partial rotation masks, rotation
 offset/inversion/ADD mix modes,
 enabled rotation limits, unsupported constraint types, non-POLY curve geometry, custom split normals, and procedural
 or packed textures. Rest scale/shear/reflection is retained but diagnosed
@@ -435,3 +459,60 @@ curve picking, exact world translation and real gizmo mouse drags. Build
 the comparison test. Curves hidden in the Blender source are checked through
 the picker. Channel-space controls require the updated usdRig viewer/runtime
 and regenerated exports on desktop and iOS.
+
+### Surface bindings
+
+The extractor reads saved Surface Deform bindings from an uncompressed temporary
+copy written by Blender, using that file's SDNA rather than process-memory
+offsets. The original `.blend` is never overwritten. The temporary copy is
+removed after extraction. No source UI scripts are executed.
+
+`RigExecSurfaceBindingMover` is a shared native surface mover. Binding attributes
+hold sparse affected vertices, polygon indices, barycentric weights, binding
+weights, and `vector3f[] rigExec:offsets`. Offset components are tangent,
+bitangent and normal distances in binding space. Blender's normal distance
+becomes `(0, 0, distance)`; runtime supports all three components.
+
+The native mover also accepts limit-surface position and derivative stencils
+(`rigExec:surfaceMode = "limit"`) and area-weighted interpolated vertex normals
+(`rigExec:normalMode = "smooth"`). Limit mode requires authored limit stencils;
+it does not reinterpret polygon weights as subdivision coordinates. Blender
+Surface Deform exports use polygon positions and geometric polygon normals
+to preserve Blender's binding behavior. Topology changes require rebinding.
+
+The converter preserves modifier order across armatures, Delta Mush, surface
+bindings, supported shrinkwrap and lattices. Lattice cages are native
+`UsdGeomPoints` dependencies; their weighted Hooks use ordinary matrix movers
+and the existing frame expression. The original lattice grid remains the
+reference even when its saved control points were edited.
+
+Absolute or topology-prepared shape keys, radial Hook falloff, lattice data weight groups, unsupported
+shrinkwrap policies and source drivers remain diagnosed. Nontriangular
+shrinkwrap targets retain a captured tessellation; Blender can change its
+diagonals as a cage deforms. Native operator coverage does not establish full
+production asset parity when upstream deformation or constraints differ.
+Strict conversion still rejects diagnostics.
+
+Exported native fixtures are also evaluated in fresh core-only processes by
+`coreOnlyNativeUsdParity` and `coreOnlyDualQuaternionParity`. These tests exclude
+the converter from plugin discovery, assert that its library is absent, reject
+legacy runtime type names in new exports, and compare edited poses to Blender.
+`tests/checkStockControlRuntime.py --require-core-runtime` checks real asset
+control frames, root-driven geometry, edit restoration, schema ownership, and
+the loaded runtime image without writing the source asset.
+
+Upgrade an existing exported asset without evaluation or reconversion:
+
+```sh
+source ../usdRig/bin/_env.sh
+"$PY" tools/migrate_runtime.py saved-backup.usdz character.usdz
+```
+
+The migration tool belongs to this source translator, not the shared runtime.
+It renames the seven legacy type names in every packaged USD layer and variant,
+including nested packages, while preserving composition, entry names, and asset
+bytes. It writes a distinct output atomically and verifies that the source stays
+unchanged. USDC/USD roots are also supported; external legacy layers must be
+migrated first or supplied as a complete USDZ. No core legacy aliases are needed.
+Packages with ambiguous entry paths, symbolic links, or explicit directory
+entries are rejected before replacing the output.
