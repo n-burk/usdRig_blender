@@ -39,6 +39,10 @@ venv/
 *.blend2
 *.blend@
 
+# Local agent state
+.claude/
+.omc/
+
 # macOS / editors
 .DS_Store
 .vscode/

@@ -1,8 +1,12 @@
 #include "rigExec/rigEvaluator.h"
+#include "pxr/base/gf/matrix3d.h"
+#include "pxr/base/gf/matrix4d.h"
+#include "pxr/base/gf/rotation.h"
 #include "pxr/base/plug/registry.h"
 #include "pxr/base/js/json.h"
 #include "pxr/usd/sdf/layer.h"
 #include "pxr/usd/usd/primRange.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -73,6 +77,35 @@ int main(int argc,char **argv) {
             CHECK((moved[3]-GfVec3f(1,1,0)).GetLength()<1e-5);
             CHECK(control.GetAttribute(TfToken("avars:tx")).Set(0.0));
             CHECK((points("Body")[2]-rest[2]).GetLength()<1e-5);
+            // A signed shape key deforms through its negative range without Blender:
+            // that branch blends by a mover-inverted weight read after movers.
+            {
+                std::ifstream source(argv[3]); CHECK(source);
+                auto shaped=JsParseStream(source).GetJsObject();
+                auto shapedMeshes=shaped.at("meshes").GetJsArray(); auto shapedMesh=shapedMeshes[0].GetJsObject();
+                JsArray deltas(rest.size(),JsValue(JsArray{JsValue(0.0),JsValue(0.0),JsValue(0.25)}));
+                shapedMesh["shape_keys"]=JsValue(JsArray{JsValue(JsObject{{"name",JsValue("Signed")},{"value",JsValue(-0.5)},
+                    {"mute",JsValue(false)},{"minimum",JsValue(-1.0)},{"maximum",JsValue(1.0)},{"deltas",JsValue(deltas)}})});
+                shapedMeshes[0]=JsValue(shapedMesh); shaped["meshes"]=JsValue(shapedMeshes);
+                auto layer=SdfLayer::CreateAnonymous("signed-shape.blendrig");
+                CHECK(layer->ImportFromString(JsWriteToString(JsValue(shaped))));
+                auto st=UsdStage::Open(layer); CHECK(st);
+                st->SetEditTarget(st->GetSessionLayer());
+                UsdAttribute channel; SdfPath body;
+                for(const auto &prim:st->Traverse()) for(const auto &attr:prim.GetAttributes())
+                    if(attr.GetCustomDataByKey(TfToken("blender:shapeKey"))==VtValue(std::string("Signed"))) { channel=attr; body=prim.GetPath(); }
+                CHECK(channel);
+                rigExec::RigExecRigEvaluator eval(st,SdfPath("/Rig"));
+                errors.clear(); CHECK(eval.Compile(&errors)); CHECK(errors.empty());
+                const auto offset=[&](float expected) {
+                    const auto pose=eval.Evaluate(UsdTimeCode::Default()); CHECK(pose.valid);
+                    const auto moved=pose.movedProperties.at(body.AppendProperty(TfToken("points"))).Get<VtVec3fArray>();
+                    CHECK(moved.size()==rest.size());
+                    for(size_t i=0;i<rest.size();++i)CHECK((moved[i]-rest[i]-GfVec3f(0,0,0.25f*expected)).GetLength()<1e-6);
+                };
+                offset(-0.5f);   // the saved value
+                for(float weight:{-1.f,-0.25f,0.f,0.5f,1.f,-0.75f}) { CHECK(channel.Set(weight)); offset(weight); }
+            }
             // A synthetic Blender armature exercises the converter's native
             // SpaceSwitch controls independently of the skin fixture's plain
             // RigExec joints. Repeated edits keep one evaluator compiled.
@@ -122,6 +155,72 @@ int main(int argc,char **argv) {
                 for(const auto &name:{"Root","Tip"})
                     sameFrame(pose.controlFrames.at(controlPaths.at(name)),pose.jointFramesBase.at(bonePaths.at(name)));
             }
+            // The static providers that hold the Controls and the mechanism
+            // frames are inert to their channels: every frame beneath them is
+            // absolute or switched.
+            {
+                const auto before=nativeRig.Evaluate(UsdTimeCode::Default()); CHECK(before.valid);
+                for(const char *holder:{"/Rig/Controls","/Rig/Mechanisms"}) {
+                    const auto prim=nativeStage->GetPrimAtPath(SdfPath(holder)); CHECK(prim.GetTypeName()==TfToken("RigExecControl"));
+                    for(const auto &edit:std::vector<std::pair<const char *,double>>{{"tx",3.0},{"rz",40.0},{"sy",2.0}})
+                        CHECK(prim.GetAttribute(TfToken(std::string("avars:")+edit.first)).Set(edit.second));
+                }
+                const auto after=nativeRig.Evaluate(UsdTimeCode::Default()); CHECK(after.valid);
+                for(const auto &name:{"Root","Tip"}) {
+                    for(int i=0;i<4;++i)CHECK(before.jointFramesFinal.at(bonePaths.at(name)).points[i]==after.jointFramesFinal.at(bonePaths.at(name)).points[i]);
+                    sameFrame(after.controlFrames.at(controlPaths.at(name)),after.jointFramesBase.at(bonePaths.at(name)));
+                }
+                for(const auto &moved:before.movedProperties) CHECK(after.movedProperties.at(moved.first)==moved.second);
+            }
+            // Rests saved in single precision are rigid only to about 1e-7, and
+            // RigExec orthonormalizes every rest level of a default space. A native
+            // Control must still equal its bone's pre-constraint frame to rounding
+            // at any scale, not merely within an absolute tolerance near the origin.
+            {
+                auto rounded=synthetic; auto records=rounded.at("nodes").GetJsArray();
+                double angle=23.0;
+                for(auto &record:records) {
+                    auto n=record.GetJsObject(); const auto id=n.at("id").GetString();
+                    if(id!="Armature" && id!="Root" && id!="Tip")continue;
+                    const GfMatrix4d rest(GfRotation(GfVec3d(0.3,-0.5,0.8),angle),GfVec3d(0.25,angle/40,-0.75)); angle+=37.0;
+                    JsArray values;
+                    for(int i=0;i<16;++i)values.push_back(JsValue(double(float(rest[i/4][i%4]))));
+                    n["rest"]=JsValue(values); record=JsValue(n);
+                }
+                rounded["nodes"]=JsValue(records);
+                auto layer=SdfLayer::CreateAnonymous("rounded-rest.blendrig");
+                CHECK(layer->ImportFromString(JsWriteToString(JsValue(rounded))));
+                auto st=UsdStage::Open(layer); CHECK(st);
+                st->SetEditTarget(st->GetSessionLayer());
+                SdfPath armature;
+                for(const auto &prim:st->Traverse())
+                    if(prim.GetCustomDataByKey(TfToken("blender:id"))==VtValue(std::string("Armature")))armature=prim.GetPath();
+                CHECK(!armature.IsEmpty());
+                // Both are native: a literal default space, no neutral provider.
+                for(const auto &name:{"Root","Tip"}) {
+                    const auto space=st->GetPrimAtPath(controlPaths.at(name)).GetAttribute(TfToken("default:space"));
+                    CHECK(space.HasAuthoredValue() && !space.HasAuthoredConnections());
+                }
+                rigExec::RigExecRigEvaluator eval(st,SdfPath("/Rig"));
+                errors.clear(); CHECK(eval.Compile(&errors)); CHECK(errors.empty());
+                const auto exact=[&]() {
+                    const auto pose=eval.Evaluate(UsdTimeCode::Default()); CHECK(pose.valid);
+                    for(const auto &name:{"Root","Tip"}) {
+                        const auto &control=pose.controlFrames.at(controlPaths.at(name));
+                        const auto &bone=pose.jointFramesBase.at(bonePaths.at(name));
+                        for(int i=0;i<4;++i)
+                            CHECK((control.points[i]-bone.points[i]).GetLength()<=1e-12*std::max(1.0,bone.points[i].GetLength()));
+                    }
+                };
+                exact();
+                for(const auto &edit:std::vector<std::tuple<SdfPath,std::string,double>>{
+                    {armature,"sx",25.0},{armature,"sy",25.0},{armature,"sz",25.0},{armature,"tx",1000.0},{armature,"ty",-750.0},
+                    {armature,"rz",33.0},{controlPaths.at("Root"),"rx",40.0},{controlPaths.at("Root"),"sx",1.6},{controlPaths.at("Root"),"tz",3.0},
+                    {controlPaths.at("Tip"),"ry",-35.0},{controlPaths.at("Tip"),"sy",0.55},{controlPaths.at("Tip"),"tx",2.0}}) {
+                    CHECK(st->GetPrimAtPath(std::get<0>(edit)).GetAttribute(TfToken("avars:"+std::get<1>(edit))).Set(std::get<2>(edit)));
+                    exact();
+                }
+            }
             // Every Blender inheritance mode must retain exact channel values
             // and publish the same pre-constraint pose on its editable control.
             for(const char *mode:{"FULL","NONE","AVERAGE","ALIGNED","FIX_SHEAR","NONE_LEGACY"})
@@ -143,6 +242,18 @@ int main(int argc,char **argv) {
                 st->SetEditTarget(st->GetSessionLayer());
                 rigExec::RigExecRigEvaluator eval(st,SdfPath("/Rig"));
                 errors.clear(); CHECK(eval.Compile(&errors)); CHECK(errors.empty());
+                // A bone Blender does not pose as one TRS over its parent publishes
+                // its rotation and translation bases as two evaluated providers.
+                const auto tip=st->GetPrimAtPath(controlPaths.at("Tip"));
+                SdfPathVector bases; tip.GetRelationship(TfToken("rigExec:channelSpaces")).GetTargets(&bases);
+                CHECK(bases.size()==(connected || !local || !inherit || std::string(mode)!="FULL" ? 2 : 0));
+                bool translates=true; CHECK(tip.GetAttribute(TfToken("rigExec:translationEnabled")).Get(&translates));
+                CHECK(translates==(bases.empty() || !connected));
+                // Their holders are inert too.
+                for(const auto &base:bases) {
+                    const auto holder=st->GetPrimAtPath(base.GetParentPath()); CHECK(holder.GetTypeName()==TfToken("RigExecControl"));
+                    CHECK(holder.GetAttribute(TfToken("avars:tx")).Set(2.0)); CHECK(holder.GetAttribute(TfToken("avars:rz")).Set(30.0));
+                }
                 for(const auto &edit:std::vector<std::tuple<std::string,std::string,double>>{
                     {"Root","rz",31.0},{"Root","sx",1.4},{"Root","sy",0.7},
                     {"Tip","tx",0.3},{"Tip","ry",27.0},{"Tip","sz",1.2}}) {
@@ -150,6 +261,25 @@ int main(int argc,char **argv) {
                         .GetAttribute(TfToken("avars:"+std::get<1>(edit))).Set(std::get<2>(edit)));
                     const auto result=eval.Evaluate(UsdTimeCode::Default()); CHECK(result.valid);
                     sameFrame(result.controlFrames.at(controlPaths.at("Tip")),result.jointFramesBase.at(bonePaths.at("Tip")));
+                    if(bases.empty())continue;
+                    // The channelSpaces contract: the control sits at
+                    // translationSpace.Transform(T) and turns by its XYZ
+                    // rotation inside the rotation space, whatever the scale.
+                    const auto &posed=result.controlFrames.at(controlPaths.at("Tip"));
+                    const auto &rotation=result.controlFrames.at(bases[0]),&translation=result.controlFrames.at(bases[1]);
+                    double channels[9];
+                    for(int i=0;i<9;++i)CHECK(tip.GetAttribute(TfToken(std::string("avars:")+
+                        std::vector<const char *>{"tx","ty","tz","rx","ry","rz","sx","sy","sz"}[i])).Get(&channels[i]));
+                    auto origin=translation.Origin();
+                    if(translates) origin+=channels[0]*(translation.X()-translation.Origin())+
+                        channels[1]*(translation.Y()-translation.Origin())+channels[2]*(translation.Z()-translation.Origin());
+                    CHECK((posed.Origin()-origin).GetLength()<1e-9);
+                    GfMatrix3d turn(1),space,actual;
+                    for(int i=0;i<3;++i) { GfVec3d axis(0); axis[i]=1; turn*=GfMatrix3d(GfRotation(axis,channels[i+3])); }
+                    space.SetRow(0,rotation.X()-rotation.Origin()); space.SetRow(1,rotation.Y()-rotation.Origin()); space.SetRow(2,rotation.Z()-rotation.Origin());
+                    actual.SetRow(0,posed.X()-posed.Origin()); actual.SetRow(1,posed.Y()-posed.Origin()); actual.SetRow(2,posed.Z()-posed.Origin());
+                    const auto expected=turn*space;
+                    for(int i=0;i<3;++i)CHECK((actual.GetRow(i).GetNormalized()-expected.GetRow(i).GetNormalized()).GetLength()<1e-9);
                 }
             }
             auto constrained=synthetic;

@@ -102,34 +102,17 @@ def main():
             parser.error("requested control or operation is unsupported: " + name + "/" + operation)
     preferred = [
         ("global translation", ("root", "Root"), "translate"),
-        ("left hand IK", ("hand_ik.L", "IK-Wrist.L"), "translate"),
-        ("right hand IK", ("hand_ik.R", "IK-Wrist.R"), "translate"),
+        ("left hand IK", ("hand_ik.L", "IK-Wrist.L", "IK-Hand.L", "IK-MSTR-Wrist.L"), "translate"),
+        ("right hand IK", ("hand_ik.R", "IK-Wrist.R", "IK-Hand.R", "IK-MSTR-Wrist.R"), "translate"),
         ("left arm FK rotation", ("upper_arm_fk.L", "FK-UpperArm.L"), "rotate"),
         ("right arm FK rotation", ("upper_arm_fk.R", "FK-UpperArm.R"), "rotate"),
-        ("left foot IK", ("foot_ik.L", "IK-Foot.L"), "translate"),
-        ("right foot IK", ("foot_ik.R", "IK-Foot.R"), "translate"),
+        ("left foot IK", ("foot_ik.L", "IK-Foot.L", "IK-MSTR-Foot.L"), "translate"),
+        ("right foot IK", ("foot_ik.R", "IK-Foot.R", "IK-MSTR-Foot.R"), "translate"),
         ("head rotation", ("head", "ROOT-Head"), "rotate"),
         ("jaw rotation", ("jaw_master", "Jaw", "jaw"), "rotate"),
         ("torso rotation", ("torso", "TORSO-Spine", "IK-CTR-Spine"), "rotate"),
     ]
     preferred.extend(("requested control " + name,(name,),operation) for name,operation in args.control)
-    if "Tail-SPIK03" in controls:
-        preferred.append(("tail tip translation", ("Tail-SPIK03",), "translate"))
-    if "Eye.L" in controls:
-        preferred.append(("left eye rotation", ("Eye.L",), "rotate"))
-        preferred.append(("left eye target translation", ("Eye.L",), "translate_fine"))
-    if "Eyelid_Master.T.L" in controls:
-        preferred.append(("left upper eyelid rotation", ("Eyelid_Master.T.L",), "rotate"))
-        preferred.append(("left upper eyelid translation", ("Eyelid_Master.T.L",), "translate_fine"))
-    # Exercise both lattice Hook deformation and movement of its parent frame.
-    # These optional controls are present on Ellie; other rigs retain their
-    # existing capture set.
-    for name in ("LTC-FannyPack_Bag", "LTC-FannyPack_Bag_Top"):
-        if name in controls:
-            preferred.append(("bag lattice translation", (name,), "translate_fine"))
-            parent = "ROOT-" + name
-            if parent in controls:
-                preferred.append(("bag lattice parent rotation", (parent,), "rotate"))
     state = {pb.name: pb.matrix_basis.copy() for pb in rig.pose.bones}
     shape_channels = []
     for mesh_name, key_name in args.shape_key:

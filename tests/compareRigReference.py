@@ -109,8 +109,13 @@ def compare_pose(sample, reference, reference_path, providers, meshes, baseline,
         failing += error > reference["tolerance"]
         ident_parts = json.loads(ident)
         rig_failing += error > reference["tolerance"] and ident_parts[2] == reference["rig"]
-        source_data = json.loads(prim.GetCustomDataByKey("blender:source"))
-        deform_failing += error > reference["tolerance"] and source_data.get("deform", False) and ident_parts[2] == reference["rig"]
+        # Exports before the compact metadata carried the whole bone record.
+        deform = prim.GetCustomDataByKey("blender:deform")
+        if deform is None and prim.GetCustomDataByKey("blender:source"):
+            deform = json.loads(prim.GetCustomDataByKey("blender:source")).get("deform", False)
+        # Without either the deform-bone verdict below would silently pass.
+        assert deform is not None, "bone carries neither blender:deform nor blender:source: " + ident
+        deform_failing += error > reference["tolerance"] and bool(deform) and ident_parts[2] == reference["rig"]
         worst.append({"id": ident, "matrix_error": error,
                       "origin_error": float(np.linalg.norm(matrix[3, :3] - expected[3, :3]))})
     result["bones"] = {"compared": len(sample["bones"]), "failing": failing, "max_matrix_error": maximum,

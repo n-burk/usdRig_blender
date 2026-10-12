@@ -8,7 +8,7 @@ import bpy
 from mathutils import Euler, Matrix, Vector
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blender"))
-from extract import bone_id, object_id, snapshot
+from extract import bone_id, object_id, picker_data, snapshot
 
 
 def main():
@@ -167,7 +167,11 @@ def main():
     armature["rig_id"] = "native_picker_fixture"
     for label, row, names in (("Main", 1, ("Root",)), ("Hand", 2, ("Tip.L",))):
         collection = armature.collections.new(label)
-        collection["rigify_ui_row"] = row
+        # Rigify registers the row with bpy.props. Blender 5 stores such a
+        # value as a system property, earlier files as a custom property:
+        # the fixture holds one collection of each.
+        system = label == "Hand" and hasattr(collection, "bl_system_properties_get")
+        (collection.bl_system_properties_get(do_create=True) if system else collection)["rigify_ui_row"] = row
         for name in names:
             collection.assign(armature.bones[name])
         collection.is_visible = label != "Hand"
@@ -196,6 +200,9 @@ def main():
     source_child = source_data.collections.new("Nested", parent=source_collection)
     source_child.assign(source_data.bones["Target"])
     source_child.is_visible = False
+    # "Controls" then holds two bones, one through its nested child, so the
+    # sidebar binding below is a source button that selects a group.
+    source_collection.assign(source_data.bones["Parent"])
     cloud_panels = {
         "Settings": {"parent_id": "", "": {"Row": {"Target": {
             "owner_path": 'pose.bones["Target"]', "prop_name": '["switch"]',
@@ -769,6 +776,32 @@ def main():
             if con.type == "STRETCH_TO":
                 con.mute = True
     bpy.ops.wm.save_as_mainfile(filepath=str(output / "strict.blend"), compress=True)
+    # A generated rig that stores no UI rows gets its pages from its control
+    # collections. Built after every .blend is saved, so no fixture carries it.
+    plain_data = bpy.data.armatures.new("Collections")
+    plain = bpy.data.objects.new("Collections", plain_data)
+    scene.collection.objects.link(plain)
+    for obj in bpy.context.selected_objects:
+        obj.select_set(False)
+    plain.select_set(True)
+    bpy.context.view_layer.objects.active = plain
+    bpy.ops.object.mode_set(mode="EDIT")
+    for index, name in enumerate(("Lever", "Slide", "Unshaped", "Locked", "Mechanism")):
+        bone = plain_data.edit_bones.new(name)
+        bone.head, bone.tail = (index, 0, 0), (index, 1, 0)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    plain_data["rig_id"] = "collection_picker_fixture"
+    controls, mechanisms = plain_data.collections.new("Controls"), plain_data.collections.new("Mechanisms")
+    for name in ("Lever", "Slide", "Unshaped", "Locked", "Mechanism"):
+        (mechanisms if name == "Mechanism" else controls).assign(plain_data.bones[name])
+        if name not in ("Unshaped", "Mechanism"):
+            plain.pose.bones[name].custom_shape = shape
+    locked = plain.pose.bones["Locked"]
+    locked.lock_location, locked.lock_rotation, locked.lock_scale = [True] * 3, [True] * 3, [True] * 3
+    locked.lock_rotation_w = True
+    plain.pose.bones["Lever"]["amount"] = 0.5
+    with (output / "collections-picker.json").open("w") as stream:
+        json.dump(picker_data(plain), stream, allow_nan=False)
     print("Created compressed .blend fixtures and independent Blender reference poses")
 
 

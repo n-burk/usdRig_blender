@@ -1,12 +1,15 @@
 #!/bin/bash
 # Launch the installed RigExec viewer; enable source translation only for .blend inputs.
 set -euo pipefail
+# The sibling usdRig checkout supplies Python, OpenUSD and usdview (bin/_env.sh).
+# USDBLENDERRIG_BUILD names this plugin's build tree when it is not <repo>/build.
 BLENDER_RIG_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$BLENDER_RIG_ROOT/../usdRig/bin/_env.sh"
-BLENDER_RIG_PREFIX="$BLENDER_RIG_ROOT/build/install"
+BLENDER_RIG_BUILD="${USDBLENDERRIG_BUILD:-$BLENDER_RIG_ROOT/build}"
+BLENDER_RIG_PREFIX="$BLENDER_RIG_BUILD/install"
 RIG_SDK="$BLENDER_RIG_ROOT/../usdRig/build/install"
-if [ -f "$BLENDER_RIG_ROOT/build/rigexec-prefix" ]; then
-    read -r RIG_SDK < "$BLENDER_RIG_ROOT/build/rigexec-prefix"
+if [ -f "$BLENDER_RIG_BUILD/rigexec-prefix" ]; then
+    read -r RIG_SDK < "$BLENDER_RIG_BUILD/rigexec-prefix"
 fi
 RIG_SDK="${USDBLENDERRIG_RIGEXEC_PREFIX:-$RIG_SDK}"
 export PYTHONPATH="$RIG_SDK/lib/python:$RIG_SDK/lib/python/rigExecUsdview:$PY_SITE${PYTHONPATH:+:$PYTHONPATH}"

@@ -27,13 +27,15 @@ bool UsdBlenderRigFileFormat::CanRead(const std::string &path) const {
 bool UsdBlenderRigFileFormat::_Read(SdfLayer *layer,const std::string &data,
                                    const std::string &source,bool metadataOnly) const {
     try {
-        bool strict=false;
+        bool strict=false,sourceData=false,pruneUnobserved=false,probeWholeRig=false;
         for(const auto &arg:layer->GetFileFormatArguments()) {
-            if(arg.first!="strict" || (arg.second!="0" && arg.second!="1"))
-                throw std::runtime_error("supported argument: strict=0|1");
-            strict=arg.second=="1";
+            bool *flag=arg.first=="strict" ? &strict : arg.first=="sourceData" ? &sourceData :
+                arg.first=="pruneUnobserved" ? &pruneUnobserved : arg.first=="probeWholeRig" ? &probeWholeRig : nullptr;
+            if(!flag || (arg.second!="0" && arg.second!="1"))
+                throw std::runtime_error("supported arguments: strict=0|1, sourceData=0|1, pruneUnobserved=0|1, probeWholeRig=0|1");
+            *flag=arg.second=="1";
         }
-        auto result=usdBlenderRig::Translate(data,source,metadataOnly,strict);
+        auto result=usdBlenderRig::Translate(data,source,metadataOnly,strict,sourceData,pruneUnobserved,probeWholeRig);
         layer->TransferContent(result);
         return true;
     } catch(const std::exception &e) {

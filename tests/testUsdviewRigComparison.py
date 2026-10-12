@@ -169,13 +169,6 @@ def testUsdviewInputFunction(app):
 
     blender = any(p.GetCustomDataByKey('blender:id') for p in all_meshes)
     if blender:
-        names = [('global root', 'root'), ('left hand IK', 'IK-Wrist.L' if label == 'Snow' else 'hand_ik.L'),
-                 ('left foot IK', 'IK-Foot.L' if label == 'Snow' else 'foot_ik.L')]
-        if label == 'Gamma':
-            names.append(('tail tip', 'Tail-SPIK03'))
-        elif label == 'Ellie':
-            names = [('global root', 'root'), ('left hand IK', 'IK-MSTR-Wrist.L'),
-                     ('left foot IK', 'IK-MSTR-Foot.L')]
         candidates = {}
         for prim in stage.Traverse():
             source_id = prim.GetCustomDataByKey('blender:sourceId')
@@ -184,6 +177,14 @@ def testUsdviewInputFunction(app):
                 opacity = prim.GetAttribute('guide:displayOpacity')
                 if name not in candidates or (opacity and (opacity.Get() or 0) > 0):
                     candidates[name] = prim
+        # The root and the left hand and foot IK control, under the name Rigify
+        # or CloudRig generates for it. USDBLENDERRIG_VIEW_CONTROLS adds
+        # workloads as comma-separated label=name pairs.
+        names = [(workload, next((n for n in options if n in candidates), options[0])) for workload, options in (
+            ('global root', ('root',)),
+            ('left hand IK', ('hand_ik.L', 'IK-Wrist.L', 'IK-Hand.L', 'IK-MSTR-Wrist.L')),
+            ('left foot IK', ('foot_ik.L', 'IK-Foot.L', 'IK-MSTR-Foot.L')))]
+        names += [tuple(entry.split('=', 1)) for entry in os.environ.get('USDBLENDERRIG_VIEW_CONTROLS', '').split(',') if '=' in entry]
     else:
         names = [('body (feet remain constrained)', 'M_Body'), ('left hand IK', 'L_ArmIK'),
                  ('left foot IK', 'L_LegIK')]
@@ -372,35 +373,27 @@ def testUsdviewInputFunction(app):
                                     'uniform_control_delta_error': float(np.linalg.norm(value - before - delta, axis=1).max(initial=0))})
             row.update(control_displacement=delta.tolist(), mesh_motion=mesh_motion,
                        passed=bool(np.linalg.norm(delta) > 1e-5 and all(s['generation_advanced'] and s['native_updates'] for s in row['samples'])))
-            if label == 'Ellie' and name == 'root':
-                facial_names = {'GEO_ellie_eye_L', 'GEO_ellie_eye_R',
-                                'GEO_ellie_eye_highlights', 'GEO_ellie_eyebrows',
-                                'GEO_ellie_eyelashes', 'GEO_ellie_head'}
-                facial = {m['path'].rsplit('/', 1)[-1]: m for m in mesh_motion
-                          if m['path'].rsplit('/', 1)[-1] in facial_names}
-                row['facial_geometry_follows_root'] = (len(facial) == len(facial_names) and all(
-                    m['point_source'] == 'published snapshot' and
-                    m['uniform_control_delta_error'] < 2e-5 for m in facial.values()))
-                row['passed'] &= row['facial_geometry_follows_root']
-            if label == 'Snow' and name == 'root':
-                teeth = {m['path'].rsplit('/', 1)[-1]: m for m in mesh_motion
-                         if m['path'].rsplit('/', 1)[-1] in {
-                             'GEO_snow_teeth_lower', 'GEO_snow_teeth_upper',
-                             'GEO_snow_gums_lower', 'GEO_snow_gums_upper'}}
-                row['teeth_follow_root'] = (len(teeth) == 4 and all(
-                    m['point_source'] == 'published snapshot' and
-                    m['uniform_control_delta_error'] < 1e-4 for m in teeth.values()))
-                row['passed'] &= row['teeth_follow_root']
-            if label == 'Gamma' and name == 'Tail-SPIK03':
-                body = next((m for m in mesh_motion if m['path'] == '/Rig/Geometry/MESH_Gamma'), None)
-                row['tail_mesh_moves'] = bool(body and body['point_source'] == 'published snapshot'
-                                              and body['max_displacement'] > 0.01)
-                row['passed'] &= row['tail_mesh_moves']
-            if label == 'Gamma' and name == 'foot_ik.L':
-                body = next((m for m in mesh_motion if m['path'] == '/Rig/Geometry/MESH_Gamma'), None)
-                row['foot_mesh_moves'] = bool(body and body['point_source'] == 'published snapshot'
-                                              and body['max_displacement'] > 0.01)
-                row['passed'] &= row['foot_mesh_moves']
+            # Expectations a caller knows about its asset, never built in:
+            # USDBLENDERRIG_VIEW_RIGID_MESHES lists mesh prim names that must
+            # follow a root drag as one rigid translation, within
+            # USDBLENDERRIG_VIEW_RIGID_TOLERANCE (default 2e-5);
+            # USDBLENDERRIG_VIEW_MOVED_MESHES lists control=mesh pairs whose
+            # mesh that control's drag must displace by more than 0.01.
+            by_mesh = {m['path'].rsplit('/', 1)[-1]: m for m in mesh_motion}
+            rigid = [n for n in os.environ.get('USDBLENDERRIG_VIEW_RIGID_MESHES', '').split(',') if n]
+            if rigid and name == 'root':
+                tolerance = float(os.environ.get('USDBLENDERRIG_VIEW_RIGID_TOLERANCE', '2e-5'))
+                row['rigid_meshes_follow_root'] = all(
+                    n in by_mesh and by_mesh[n]['point_source'] == 'published snapshot' and
+                    by_mesh[n]['uniform_control_delta_error'] < tolerance for n in rigid)
+                row['passed'] &= row['rigid_meshes_follow_root']
+            moved = [entry.split('=', 1)[1] for entry in os.environ.get('USDBLENDERRIG_VIEW_MOVED_MESHES', '').split(',')
+                     if '=' in entry and entry.split('=', 1)[0] == name]
+            if moved:
+                row['meshes_move'] = all(
+                    n in by_mesh and by_mesh[n]['point_source'] == 'published snapshot' and
+                    by_mesh[n]['max_displacement'] > 0.01 for n in moved)
+                row['passed'] &= row['meshes_move']
             for field in ('event_ms', 'input_to_paint_ms', 'native_preview_ms'):
                 values = [s[field] for s in row['samples']]
                 row[field] = {'median': float(np.median(values)), 'p95': float(np.percentile(values, 95)),

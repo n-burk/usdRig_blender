@@ -81,10 +81,20 @@ def testUsdviewInputFunction(app):
         panel.close()
         raise AssertionError('No live picker button for '+str(prim.GetPath()))
 
-    names = ('IK-Wrist.L', 'IK-Foot.L') if 'Snow' in label else ('hand_ik.L', 'foot_ik.L')
+    # USDBLENDERRIG_VIEW_CONTROLS names the source controls to test, comma
+    # separated. The default is the left hand and foot IK control under the
+    # name Rigify or CloudRig generates for it, whichever the rig has.
+    by_name = {}
+    for p in stage.Traverse():
+        ident = p.GetCustomDataByKey('blender:sourceId')
+        if ident:
+            by_name.setdefault(json.loads(ident)[-1], p)
+    requested = [n for n in os.environ.get('USDBLENDERRIG_VIEW_CONTROLS', '').split(',') if n]
+    names = requested or [next((n for n in candidates if n in by_name), candidates[0]) for candidates in (
+        ('hand_ik.L', 'IK-Wrist.L', 'IK-Hand.L', 'IK-MSTR-Wrist.L'), ('foot_ik.L', 'IK-Foot.L', 'IK-MSTR-Foot.L'))]
     for name in names:
-        prim = next(p for p in stage.Traverse() if p.GetCustomDataByKey('blender:sourceId')
-                    and json.loads(p.GetCustomDataByKey('blender:sourceId'))[-1] == name)
+        assert name in by_name, 'no control named ' + name
+        prim = by_name[name]
         row = {'name': name, 'control': str(prim.GetPath())}
         controller.SetTool(gizmoUI.TOOL_SELECT)
         api.dataModel.selection.clearPrims(); pump()

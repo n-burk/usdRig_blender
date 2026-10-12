@@ -19,6 +19,18 @@ add_library(usdBlenderRig SHARED fileFormat.cpp blenderReader.cpp translator.cpp
 target_compile_features(usdBlenderRig PRIVATE cxx_std_17)
 target_include_directories(usdBlenderRig PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(usdBlenderRig PRIVATE rigExec::rigExecRigging rigExec::rigExec usdGeom usdSkel usdShade ar plug js)
+# usdRig keeps USD scene lowering in librigExecScene, which registers the compile
+# hooks when it loads; RigExecRigEvaluator::Compile fails without it. sceneLink.cpp
+# references the library so --as-needed/dead-strip linkers keep the dependency.
+if(NOT TARGET rigExec::rigExecScene)
+    message(FATAL_ERROR "usdBlenderRig targets usdRig main: the rigExec package at ${rigExec_DIR} "
+        "has no rigExec::rigExecScene. Rebuild and reinstall usdRig, or pass -DrigExec_DIR.")
+endif()
+function(usdblenderrig_link_scene target)
+    target_link_libraries(${target} PRIVATE rigExec::rigExecScene)
+    target_sources(${target} PRIVATE "${PROJECT_SOURCE_DIR}/sceneLink.cpp")
+endfunction()
+usdblenderrig_link_scene(usdBlenderRig)
 set_target_properties(usdBlenderRig PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 if(MSVC)
     target_compile_definitions(usdBlenderRig PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -50,10 +62,60 @@ elseif(UNIX)
 endif()
 if(BUILD_TESTING)
     find_program(USDBLENDERRIG_PYTHON3 NAMES python3)
+    # Tests that open a stage need the interpreter this OpenUSD was built with:
+    # USDBLENDERRIG_USD_PYTHON, else the one its pxrConfig.cmake records, else python3.
+    set(USDBLENDERRIG_USD_PYTHON "" CACHE FILEPATH "Python interpreter that imports this OpenUSD build's pxr")
+    set(_usd_pythons "${USDBLENDERRIG_USD_PYTHON}")
+    if(EXISTS "${pxr_DIR}/pxrConfig.cmake")
+        file(STRINGS "${pxr_DIR}/pxrConfig.cmake" _recorded REGEX "set\\(Python3_EXECUTABLE \\[\\[")
+        foreach(_line IN LISTS _recorded)
+            string(REGEX REPLACE ".*\\[\\[(.*)\\]\\].*" "\\1" _line "${_line}")
+            list(APPEND _usd_pythons "${_line}")
+        endforeach()
+    endif()
+    list(APPEND _usd_pythons "${USDBLENDERRIG_PYTHON3}")
+    file(GLOB _usd_sites "${rigExec_USD_INSTALL_DIR}/lib/python" "${rigExec_USD_INSTALL_DIR}/lib/python*/site-packages"
+        "${rigExec_USD_INSTALL_DIR}/Lib/site-packages")
+    set(_usd_python "")
+    foreach(_python IN LISTS _usd_pythons)
+        foreach(_site IN LISTS _usd_sites)
+            if(NOT _usd_python AND _python AND EXISTS "${_python}" AND EXISTS "${_site}/pxr")
+                execute_process(COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${_site}" "${_python}" -c "from pxr import Usd"
+                    RESULT_VARIABLE _usd_python_failed OUTPUT_QUIET ERROR_QUIET)
+                if(NOT _usd_python_failed)
+                    set(_usd_python "${_python}")
+                    set(_usd_site "${_site}")
+                endif()
+            endif()
+        endforeach()
+    endforeach()
+    if(_usd_python)
+        message(STATUS "Stage-reading Python tests use ${_usd_python}")
+    else()
+        message(STATUS "No Python imports pxr from ${rigExec_USD_INSTALL_DIR}: stage-reading Python tests are not registered (set USDBLENDERRIG_USD_PYTHON)")
+    endif()
+    # A stage-reading Python test: this plugin and the RigExec schema only.
+    function(usdblenderrig_usd_python_test name)
+        add_test(NAME ${name} COMMAND "${_usd_python}" ${ARGN})
+        set_tests_properties(${name} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PYTHONPATH=path_list_prepend:${_usd_site};PXR_PLUGINPATH_NAME=set:${_resources};PXR_PLUGINPATH_NAME=path_list_append:${rigExec_PLUGIN_DIR}/rigExecSchema/resources")
+    endfunction()
     if(USDBLENDERRIG_PYTHON3)
         add_test(NAME pickerInventory COMMAND "${USDBLENDERRIG_PYTHON3}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/testPickerInventory.py")
-        if(UNIX)
+        add_test(NAME legFixture COMMAND "${USDBLENDERRIG_PYTHON3}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/makeLegFixture.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/leg.blendrig" --check)
+        # The launcher takes its Python and OpenUSD from the sibling usdRig checkout.
+        if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../usdRig/bin/_env.sh")
             add_test(NAME launcherFileFormatOnly COMMAND "${USDBLENDERRIG_PYTHON3}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/testLauncherEnvironment.py")
+            set_tests_properties(launcherFileFormatOnly PROPERTIES ENVIRONMENT "USDBLENDERRIG_BUILD=${CMAKE_CURRENT_BINARY_DIR}")
+        endif()
+    endif()
+    if(_usd_python)
+        usdblenderrig_usd_python_test(migrateRuntime "${CMAKE_CURRENT_SOURCE_DIR}/tests/testMigrateRuntime.py")
+        # The checked-in template is the usdRig biped example pickers, regenerated.
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../usdRig/examples/biped/Biped_body_picker.usda")
+            usdblenderrig_usd_python_test(pickerTemplate "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_picker_template.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../usdRig/examples/biped" "${CMAKE_CURRENT_SOURCE_DIR}/resources/biped_picker.usda" --check)
         endif()
     endif()
     # Read the immutable generation usdview/Hydra consumes, without creating a
@@ -71,6 +133,7 @@ if(BUILD_TESTING)
     add_executable(testUsdBlenderRigEvaluation tests/testEvaluation.cpp)
     target_compile_features(testUsdBlenderRigEvaluation PRIVATE cxx_std_17)
     target_link_libraries(testUsdBlenderRigEvaluation PRIVATE rigExec::rigExec js)
+    usdblenderrig_link_scene(testUsdBlenderRigEvaluation)
     add_dependencies(testUsdBlenderRigEvaluation usdBlenderRig)
     add_test(NAME evaluation COMMAND testUsdBlenderRigEvaluation "${_resources}"
         "${rigExec_PLUGIN_DIR}/rigExecSchema/resources" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/rig.blendrig")
@@ -92,6 +155,20 @@ if(BUILD_TESTING)
             "${rigExec_PLUGIN_DIR}/rigExecSchema/resources" "${CMAKE_CURRENT_BINARY_DIR}/blender-proof")
         set_tests_properties(blenderRead PROPERTIES FIXTURES_REQUIRED blenderFiles TIMEOUT 180
             ENVIRONMENT "USDBLENDERRIG_BLENDER=${USDBLENDERRIG_BLENDER}")
+        # A rig the bundled Rigify generates, extracted the documented way by a
+        # Blender without the add-on. Skipped where this Blender has no Rigify.
+        add_test(NAME rigifyFixture COMMAND "${USDBLENDERRIG_BLENDER}" --background --factory-startup
+            --python-exit-code 1 --python "${CMAKE_CURRENT_SOURCE_DIR}/tests/makeRigifyFixture.py"
+            -- "${CMAKE_CURRENT_BINARY_DIR}/blender-proof")
+        set_tests_properties(rigifyFixture PROPERTIES FIXTURES_SETUP rigifyFiles SKIP_RETURN_CODE 77 TIMEOUT 180)
+        if(_usd_python)
+            usdblenderrig_usd_python_test(pickerPackaging "${CMAKE_CURRENT_SOURCE_DIR}/tests/testPickerPackaging.py"
+                "${CMAKE_CURRENT_BINARY_DIR}/blender-proof" "${CMAKE_CURRENT_BINARY_DIR}/picker-proof")
+            set_tests_properties(pickerPackaging PROPERTIES FIXTURES_REQUIRED blenderFiles TIMEOUT 180)
+            usdblenderrig_usd_python_test(rigifyPicker "${CMAKE_CURRENT_SOURCE_DIR}/tests/testRigifyPicker.py"
+                "${CMAKE_CURRENT_BINARY_DIR}/blender-proof")
+            set_tests_properties(rigifyPicker PROPERTIES FIXTURES_REQUIRED rigifyFiles SKIP_RETURN_CODE 77 TIMEOUT 180)
+        endif()
         add_test(NAME blenderParity COMMAND testUsdBlenderRigEvaluation "${_resources}"
             "${rigExec_PLUGIN_DIR}/rigExecSchema/resources" "${CMAKE_CURRENT_BINARY_DIR}/blender-proof/rig.blend"
             "${CMAKE_CURRENT_BINARY_DIR}/blender-proof/reference.json")

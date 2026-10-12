@@ -15,7 +15,7 @@ import bpy
 from mathutils import Euler, Matrix, Vector
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from materials import Textures, extract as extract_material
-from picker import ellie_picker
+from picker import collection_picker
 from surface_bind import read_surface_bindings, read_corrective_bindings
 
 
@@ -54,6 +54,18 @@ def inert(value):
     return str(value)
 
 
+def stored(owner, key, default=None):
+    """Read a field an add-on stores, without the add-on.
+
+    Blender 5 keeps bpy.props values in system properties, apart from custom
+    properties and whether or not the add-on is registered; files written
+    by earlier versions hold them as custom properties.
+    """
+    system = owner.bl_system_properties_get() if hasattr(owner, "bl_system_properties_get") else None
+    value = system.get(key) if system is not None else None
+    return owner.get(key, default) if value is None else value
+
+
 def picker_data(obj):
     """Turn Rigify collections and CloudRig's stored panels into native pages.
 
@@ -62,9 +74,6 @@ def picker_data(obj):
     """
     if obj.type != "ARMATURE":
         return []
-    native = ellie_picker(obj, object_id, bone_id)
-    if native is not None:
-        return [native]
     collections = list(getattr(obj.data, "collections_all", []))
 
     def members(collection):
@@ -75,18 +84,18 @@ def picker_data(obj):
 
     by_name = {c.name: c for c in collections}
     pages = []
-    if obj.data.get("rig_id"):
-        for collection in sorted(collections, key=lambda c: c.get("rigify_ui_row", 0)):
-            row = collection.get("rigify_ui_row", 0)
+    if stored(obj.data, "rig_id"):
+        for collection in sorted(collections, key=lambda c: stored(c, "rigify_ui_row", 0)):
+            row = stored(collection, "rigify_ui_row", 0)
             if row <= 0:
                 continue
-            pages.append({"name": collection.get("rigify_ui_title") or collection.name,
+            pages.append({"name": stored(collection, "rigify_ui_title") or collection.name,
                 "source": {"collection": collection.name, "row": int(row),
                            "visible": collection.is_visible},
                 "buttons": [{"label": name, "controls": [bone_id(obj, name)]}
                             for name in sorted(members(collection))]})
         kind = "Rigify control collections"
-    elif obj.data.get("is_generated_cloudrig"):
+    elif stored(obj.data, "is_generated_cloudrig"):
         kind = "CloudRig sidebar panels"
 
         def pairs(value):
@@ -97,7 +106,7 @@ def picker_data(obj):
                 return {k: pairs(v) for k, v in value}
             return value
 
-        source = inert(obj.data.get("ui_data", {}))
+        source = inert(stored(obj.data, "ui_data", {}))
         panels = pairs(source.get("panels", []))
         for label, panel in panels.items():
             buttons = []
@@ -135,8 +144,11 @@ def picker_data(obj):
     else:
         return []
     if not pages:
-        return []
-    text = obj.get("rig_ui") or obj.data.get("cloudrig_ui")
+        # A generated rig without stored sidebar pages still exposes its
+        # controls: its control collections become the pages.
+        native = collection_picker(obj, object_id, bone_id)
+        return [native] if native else []
+    text = stored(obj, "rig_ui") or stored(obj.data, "rigify_rig_ui") or stored(obj.data, "cloudrig_ui")
     return [{"owner": object_id(obj), "name": obj.name, "source_kind": kind,
              "source_ui": text.as_string() if isinstance(text, bpy.types.Text) else "",
              "pages": pages}]

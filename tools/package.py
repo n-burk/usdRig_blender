@@ -47,6 +47,29 @@ def udim_records(stage, require_internal=False):
     return records
 
 
+def picker_exposure(boxes):
+    """Share of each button rectangle that a click reaches in the stock picker.
+
+    boxes are (x, y, width, height, depth, shape) of one panel's selecting
+    buttons in prim order. The picker hit-tests bounding boxes and gives the
+    click to the topmost button: widget controls first, then the larger
+    ui:depth, then the later prim. A covered button cannot be clicked, however
+    visible its outline is.
+    """
+    xs = sorted({v for b in boxes for v in (b[0], b[0] + b[2])})
+    ys = sorted({v for b in boxes for v in (b[1], b[1] + b[3])})
+    order = sorted(range(len(boxes)), key=lambda i: (boxes[i][5] == 'widgetControl', boxes[i][4], i))
+    area = [0.0] * len(boxes)
+    for x0, x1 in zip(xs, xs[1:]):
+        for y0, y1 in zip(ys, ys[1:]):
+            x, y = (x0 + x1) / 2, (y0 + y1) / 2
+            hit = [i for i in order if boxes[i][0] <= x <= boxes[i][0] + boxes[i][2]
+                   and boxes[i][1] <= y <= boxes[i][1] + boxes[i][3]]
+            if hit:
+                area[hit[-1]] += (x1 - x0) * (y1 - y0)
+    return [a / (b[2] * b[3]) if b[2] * b[3] else 0.0 for a, b in zip(area, boxes)]
+
+
 def picker_records(stage):
     records = []
     for picker in stage.Traverse():
@@ -56,7 +79,7 @@ def picker_records(stage):
         for page in picker.GetChildren():
             if page.GetTypeName() != 'RigExecPickerPanel':
                 continue
-            buttons = []
+            buttons, boxes = [], []
             for button in page.GetChildren():
                 if button.GetTypeName() != 'RigExecPickerButton':
                     continue
@@ -64,15 +87,32 @@ def picker_records(stage):
                 if any(not stage.GetPrimAtPath(p) or stage.GetPrimAtPath(p).GetTypeName()
                        not in ('RigExecControl', 'RigExecJoint') for p in targets):
                     raise ValueError('unresolved picker target: ' + str(button.GetPath()))
+                mirrors = button.GetRelationship('rigExec:picker:mirror').GetTargets()
+                if any(not p.HasPrefix(picker.GetPath()) or not stage.GetPrimAtPath(p) for p in mirrors):
+                    raise ValueError('unresolved picker mirror: ' + str(button.GetPath()))
                 buttons.append({'path': str(button.GetPath()),
                     'label': button.GetAttribute('ui:text').Get(), 'targets': list(map(str, targets)),
-                    'source': button.GetCustomDataByKey('blender:source')})
+                    'mirror': list(map(str, mirrors)), 'clickable': None})
+                # The stock picker draws neither a mode-less alternate nor a slider.
+                if targets and not button.GetAttribute('ui:alternate').Get() and button.GetAttribute('ui:shape').Get() != 'slider':
+                    position, size = button.GetAttribute('ui:position').Get(), button.GetAttribute('ui:size').Get()
+                    boxes.append((position[0], position[1], size[0], size[1],
+                                  button.GetAttribute('ui:depth').Get(), button.GetAttribute('ui:shape').Get(), buttons[-1]))
+                elif targets:
+                    buttons[-1]['clickable'] = 0.0
+            for box, share in zip(boxes, picker_exposure(boxes)):
+                box[-1]['clickable'] = round(share, 6)
             pages.append({'path': str(page.GetPath()), 'label': page.GetAttribute('ui:label').Get(),
-                          'order': page.GetAttribute('ui:order').Get(), 'buttons': buttons,
-                          'source': page.GetCustomDataByKey('blender:source')})
+                          'order': page.GetAttribute('ui:order').Get(), 'buttons': buttons})
+        # Source settings that are not selections are compact picker metadata.
         records.append({'path': str(picker.GetPath()), 'label': picker.GetAttribute('ui:label').Get(),
                         'rig': list(map(str, picker.GetRelationship('rigExec:picker:rig').GetTargets())),
-                        'source': picker.GetCustomDataByKey('blender:source'), 'pages': pages})
+                        'source_kind': picker.GetCustomDataByKey('blender:sourceKind'),
+                        'control_count': picker.GetCustomDataByKey('blender:controlCount'),
+                        'group_count': picker.GetCustomDataByKey('blender:groupCount'),
+                        'unavailable': list(picker.GetCustomDataByKey('blender:unavailable') or []),
+                        'unsupported_reason': list(picker.GetCustomDataByKey('blender:unsupportedReason') or []),
+                        'pages': pages})
     return records
 
 
@@ -139,12 +179,15 @@ def package(source, output):
               'native_prims': len(expected_prims), 'native_connections': len(expected_connections),
               'picker_pages': sum(len(p['pages']) for p in expected_pickers),
               'picker_buttons': sum(len(page['buttons']) for p in expected_pickers for page in p['pages']),
+              'picker_controls': len({t for p in expected_pickers for page in p['pages']
+                                      for button in page['buttons'] for t in button['targets']}),
               'pickers': expected_pickers, 'source_unchanged': True, 'verified': True,
               'udim_tiles': expected_udims,
               'authored_time_samples': sum(a.GetNumTimeSamples() for p in stage.Traverse() for a in p.GetAttributes())}
     output.with_suffix('.package.json').write_text(json.dumps(report, indent=2))
     print(output)
-    print(f"Verified {report['picker_pages']} picker pages, {report['picker_buttons']} buttons, {len(names)} package entries")
+    print(f"Verified {report['picker_pages']} picker pages, {report['picker_buttons']} buttons, "
+          f"{report['picker_controls']} selectable controls, {len(names)} package entries")
     return report
 
 

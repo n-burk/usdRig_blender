@@ -1,23 +1,32 @@
 """Native picker inventory; reads source data without executing rig UI scripts."""
 import json
 
-CONTROL_COLLECTIONS = {
-    'Face Main', 'Face Secondary', 'Face Tweak', 'Face Silhouette', 'Hair',
-    'Clothes Main', 'Fannypack Buckle', 'Lips', 'Tracking', 'Curve Hooks',
-    'Curve Handles',
-}
 SYSTEM_PROPERTIES = {'bone_gizmo', 'enable_bone_gizmo', 'prop_hierarchy'}
 
 
-def control_collection(name):
-    return 'Control' in name or name in CONTROL_COLLECTIONS
+def control_collections(records):
+    """Collections that hold controls: most of their bones carry a custom shape.
+
+    Measured on the rig itself, so no collection is recognised by its name.
+    """
+    bones, shaped = {}, {}
+    for record in records:
+        for name in record['collections']:
+            bones[name] = bones.get(name, 0) + 1
+            shaped[name] = shaped.get(name, 0) + bool(record['shape'])
+    return {name for name, count in bones.items() if 2 * shaped[name] > count}
 
 
 def classify(records):
-    """Keep shape and collection evidence independent of emitted USD controls."""
+    """Keep shape and collection evidence independent of emitted USD controls.
+
+    A control has a custom shape, or sits unshaped in a control collection;
+    either way it needs an editable channel or a numeric property.
+    """
     controls, excluded = [], []
+    member_of = control_collections(records)
     for record in records:
-        member = any(control_collection(c) for c in record['collections'])
+        member = any(c in member_of for c in record['collections'])
         editable = any(not v for values in record['locks'].values() for v in values)
         properties = record.get('properties', {})
         if (record['shape'] or member) and (editable or properties):
@@ -25,14 +34,19 @@ def classify(records):
         else:
             excluded.append({'name': record['name'], 'reason':
                 'no editable channels' if record['shape'] or member else
-                'no custom shape or explicit control collection'})
+                'no custom shape or control collection'})
     return controls, excluded
 
 
-def ellie_picker(obj, object_id, bone_id):
-    # Identify the generated main rig; never include its META construction rig.
-    if obj.name != 'RIG-Ellie' or not {'MSTR-Spine_Torso', 'FK-Head', 'Properties_Character_Ellie'}.issubset(obj.pose.bones.keys()):
-        return None
+def collection_picker(obj, object_id, bone_id):
+    """Source pages for a generated rig that stores no sidebar pages of its own.
+
+    One page per control collection, one entry per classified control, plus
+    one page of the numeric source settings as unavailable entries. Pages are
+    whole collections: the translator maps them onto the biped panels and
+    cuts what is left into panels, so nothing here depends on the rig name or
+    on a page size.
+    """
     records = []
     for p in obj.pose.bones:
         properties = {}
@@ -55,34 +69,32 @@ def ellie_picker(obj, object_id, bone_id):
             'hidden': bool(p.bone.hide or not any(c.is_visible_effectively for c in p.bone.collections)),
             'properties': properties})
     controls, excluded = classify(records)
+    member_of = control_collections(records)
     groups = {}
     for record in controls:
         # Preserve all memberships in inventory; one library entry per control.
         named = [c for c in record['collections'] if not c.startswith('Layer ')]
-        preferred = [c for c in named if control_collection(c)]
+        preferred = [c for c in named if c in member_of]
         group = (preferred or named or ['Other controls'])[0]
         groups.setdefault(group, []).append({'label': record['name'], 'controls': [record['id']]})
-    pages = []
-    for name, buttons in sorted(groups.items()):
-        ordered = sorted(buttons, key=lambda b: b['label'])
-        chunks = [ordered[i:i+48] for i in range(0, len(ordered), 48)]
-        for index, chunk in enumerate(chunks):
-            label = name if len(chunks) == 1 else name + ' ' + str(index+1) + '/' + str(len(chunks))
-            pages.append({'name': label, 'buttons': chunk})
+    pages = [{'name': name, 'source': {'collection': name}, 'buttons': sorted(buttons, key=lambda b: b['label'])}
+             for name, buttons in sorted(groups.items())]
     settings = []
-    eligible = {r['name'] for r in controls} | {'Properties_Character_Ellie'}
+    eligible = {r['name'] for r in controls}
     for record in records:
-        if record['name'] not in eligible:
+        # Generated rigs keep character settings on an unshaped Properties bone.
+        if record['name'] not in eligible and not record['name'].startswith('Properties'):
             continue
         for key, value in sorted(record['properties'].items()):
             settings.append({'label': record['name'] + ': ' + key, 'controls': [],
                 'source': {'binding': {'owner': record['id'], 'property': key, **value},
                     'unsupported_reason': 'Source property driver behavior is not translated to a native editable attribute'}})
-    for i in range(0, len(settings), 48):
-        pages.append({'name': 'Source settings (unavailable) ' + str(i//48+1),
-                      'buttons': settings[i:i+48]})
-    return {'owner': object_id(obj), 'name': 'Ellie', 'source_kind': 'Ellie biped and all source controls',
-        'layout': 'biped', 'source_ui': '', 'inventory': {'armature': obj.name,
+    if settings:
+        pages.append({'name': 'Source settings (unavailable)', 'buttons': settings})
+    if not pages:
+        return None
+    return {'owner': object_id(obj), 'name': obj.name, 'source_kind': 'Control collections',
+        'source_ui': '', 'inventory': {'armature': obj.name,
             'controls': controls, 'excluded': excluded, 'source_bones': len(records),
             'shape_controls': sum(bool(r['shape']) for r in controls),
             'transformControls': len(controls), 'functionalSettings': 0,
